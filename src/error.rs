@@ -259,6 +259,34 @@ pub enum RpcError {
     RateLimited,
 }
 
+/// Errors raised while constructing long-lived components (HTTP clients,
+/// in-memory filters, exporters). These replace the `expect()` calls that
+/// previously aborted the process on construction failure (issue #1246).
+#[derive(Debug, Error)]
+pub enum InitError {
+    #[error("Failed to build {component} HTTP client: {source}")]
+    HttpClient {
+        component: &'static str,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[error("Invalid {component} configuration: {reason}")]
+    InvalidConfig {
+        component: &'static str,
+        reason: String,
+    },
+}
+
+impl InitError {
+    pub fn invalid_config(component: &'static str, reason: impl Into<String>) -> Self {
+        Self::InvalidConfig {
+            component,
+            reason: reason.into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Unified AppError
 // ---------------------------------------------------------------------------

@@ -197,7 +197,7 @@ impl HealthState {
     pub fn update_last_poll(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         self.last_indexer_poll.store(now, Ordering::SeqCst);
     }
@@ -213,7 +213,7 @@ impl HealthState {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let elapsed = now.saturating_sub(last_poll);

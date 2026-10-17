@@ -35,18 +35,18 @@ pub struct SlackClient {
 }
 
 impl SlackClient {
-    pub fn new(config: SlackConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build Slack HTTP client");
+    pub fn new(config: SlackConfig) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            Client::builder().timeout(Duration::from_secs(10)),
+            "slack",
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             webhook_url: config.webhook_url,
             bot_token: config.bot_token,
             channel: config.channel,
-        }
+        })
     }
 
     /// Send a formatted message to Slack using Block Kit
@@ -333,7 +333,7 @@ mod tests {
             channel: "#notifications".to_string(),
         };
 
-        let client = SlackClient::new(config);
+        let client = SlackClient::new(config).unwrap();
         assert_eq!(client.channel, "#notifications");
         assert!(client.webhook_url.is_some());
         assert!(client.bot_token.is_some());

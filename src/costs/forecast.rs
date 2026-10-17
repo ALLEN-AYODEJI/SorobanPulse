@@ -29,7 +29,7 @@ pub fn forecast(entries: &[CostEntry], forecast_days: u32) -> Option<CostForecas
 
     // Collect (x, y) points where x is hours since the first bucket.
     let (xs, ys): (Vec<f64>, Vec<f64>) = {
-        let first_hour = *buckets.keys().next().unwrap();
+        let first_hour = buckets.keys().next().copied().unwrap_or_default();
         buckets
             .iter()
             .map(|(&h, &cost)| ((h - first_hour) as f64, cost))
@@ -39,7 +39,7 @@ pub fn forecast(entries: &[CostEntry], forecast_days: u32) -> Option<CostForecas
     let (slope, intercept) = linear_regression(&xs, &ys);
 
     // Project forward from the last observed hour.
-    let last_x = *xs.last().unwrap();
+    let last_x = xs.last().copied().unwrap_or_default();
     let horizon_hours = f64::from(forecast_days) * 24.0;
     let predicted_hourly = (intercept + slope * (last_x + horizon_hours)).max(0.0);
     let predicted_daily = predicted_hourly * 24.0;

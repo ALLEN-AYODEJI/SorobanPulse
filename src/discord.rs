@@ -73,21 +73,21 @@ fn prefix_with_role_mentions(content: &str, role_ids: &[&str]) -> String {
 }
 
 impl DiscordClient {
-    pub fn new(config: DiscordConfig) -> Self {
+    pub fn new(config: DiscordConfig) -> Result<Self, crate::error::InitError> {
         // Use the shared outbound client: redirects disabled, 10-second timeout.
         // The webhook_url is validated by `validate_discord_webhook_url` at
         // creation time; we use `build_outbound_client` here so that the same
         // hardened client is used for every subsequent request.
-        let client = crate::net::outbound::build_outbound_client(&["discord.com"]);
+        let client = crate::net::outbound::build_outbound_client(&["discord.com"])?;
 
-        Self {
+        Ok(Self {
             client,
             webhook_url: config.webhook_url,
             bot_name: config.bot_name,
             avatar_url: config.avatar_url,
             bot_token: config.bot_token,
             channel_id: config.channel_id,
-        }
+        })
     }
 
     /// Send a formatted message to Discord using embeds. `thread_id`, when
@@ -349,7 +349,7 @@ mod tests {
             channel_id: None,
         };
 
-        let client = DiscordClient::new(config);
+        let client = DiscordClient::new(config).unwrap();
         assert_eq!(client.webhook_url, "https://discord.com/api/webhooks/test");
         assert_eq!(client.bot_name, Some("Soroban Bot".to_string()));
     }

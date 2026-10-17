@@ -17,6 +17,9 @@
 //!
 //! Reads `DATABASE_URL` from the environment (or a `.env` file in the cwd).
 //! The target database must already have migrations applied.
+// Issue #1246: a panic in production is a silent availability incident.
+// Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 // Precision loss in timestamp/ledger arithmetic is acceptable for seed data.
 #![allow(
@@ -448,9 +451,15 @@ async fn seed_events(pool: &sqlx::PgPool, total: usize) -> Result<usize> {
             let ts = start + Duration::seconds(offset_secs);
             let ledger = base_ledger + (offset_secs as f64 * ledgers_per_second) as i64;
 
-            let (contract_id, _, _) = CONTRACTS.choose(&mut rng).unwrap();
-            let event_type = EVENT_TYPES.choose(&mut rng).unwrap();
-            let (topic, value) = topic_table.choose(&mut rng).unwrap();
+            let (contract_id, _, _) = CONTRACTS
+                .choose(&mut rng)
+                .context("CONTRACTS fixture table is empty")?;
+            let event_type = EVENT_TYPES
+                .choose(&mut rng)
+                .context("EVENT_TYPES fixture table is empty")?;
+            let (topic, value) = topic_table
+                .choose(&mut rng)
+                .context("topic fixture table is empty")?;
 
             // Generate a pseudo-random 64-character hex tx hash.
             let tx_hash = format!("{:016x}{:016x}{:016x}{:016x}",

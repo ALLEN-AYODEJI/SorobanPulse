@@ -114,12 +114,13 @@ pub struct SubscriptionBatchConfig {
 
 /// Build the reqwest client used by the delivery worker.
 /// Redirects are disabled to prevent SSRF via redirect chains.
-pub fn build_delivery_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("Failed to build subscription delivery HTTP client")
+pub fn build_delivery_client() -> Result<reqwest::Client, crate::error::InitError> {
+    crate::net::outbound::build_http_client(
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10)),
+        "subscription delivery",
+    )
 }
 
 /// Validate a callback URL against SSRF rules.
@@ -1276,7 +1277,7 @@ pub mod tests {
     fn build_delivery_client_does_not_follow_redirects() {
         // The only way to verify policy without making a real request is to confirm
         // the builder compiles and returns a client successfully.
-        let _client = build_delivery_client();
+        let _client = build_delivery_client().unwrap();
     }
 
     // --- Unit tests for retry backoff logic ---

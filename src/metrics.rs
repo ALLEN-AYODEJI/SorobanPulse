@@ -92,8 +92,7 @@ pub fn record_counter_state(counter_name: &str, value: u64) {
 /// SLO-aligned histogram buckets for HTTP request duration (seconds).
 const HTTP_DURATION_BUCKETS: &[f64] = &[0.05, 0.1, 0.2, 0.5, 1.0, 5.0];
 
-/// Initialize the Prometheus metrics exporter
-pub fn init_metrics() -> PrometheusHandle {
+fn prometheus_builder() -> PrometheusBuilder {
     PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(
@@ -101,9 +100,26 @@ pub fn init_metrics() -> PrometheusHandle {
             ),
             HTTP_DURATION_BUCKETS,
         )
-        .expect("Failed to set histogram buckets")
-        .install_recorder()
-        .expect("Failed to install Prometheus exporter")
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Invalid HTTP duration buckets; using exporter defaults");
+            PrometheusBuilder::new()
+        })
+}
+
+/// Initialize the Prometheus metrics exporter.
+///
+/// Installing the global recorder fails if one is already installed (e.g. a
+/// second call within the same test binary). Rather than panicking, return a
+/// handle to a detached recorder so callers still get a working `/metrics`
+/// renderer.
+pub fn init_metrics() -> PrometheusHandle {
+    match prometheus_builder().install_recorder() {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(error = %e, "Prometheus recorder already installed; returning a detached handle");
+            prometheus_builder().build_recorder().handle()
+        }
+    }
 }
 
 /// Record events indexed

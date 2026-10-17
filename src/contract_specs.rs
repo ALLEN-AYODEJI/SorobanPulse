@@ -50,7 +50,12 @@ fn code_key_b64(hash: &[u8]) -> String {
 
 /// Extract the WASM hash from a ContractData instance entry (`None` for SAC / non-WASM executables).
 pub fn wasm_hash_from_instance(entry: &[u8]) -> Option<[u8; 32]> {
-    let u = |o: usize| entry.get(o..o + 4).map(|b| u32::from_be_bytes(b.try_into().unwrap()));
+    let u = |o: usize| {
+        entry
+            .get(o..o + 4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .map(u32::from_be_bytes)
+    };
     // entry type(6), ext, address(type,hash), key type, durability, val type(19), executable type(0=wasm)
     if u(0)? != 6 || u(60 - 4)? != 19 || u(60)? != 0 { return None; }
     entry.get(64..96)?.try_into().ok()

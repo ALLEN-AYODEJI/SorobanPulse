@@ -84,22 +84,26 @@ pub struct SorobanRpcClient {
 }
 
 impl SorobanRpcClient {
-    pub fn new(config: &Config) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(config.rpc_connect_timeout_secs))
-            .timeout(Duration::from_secs(config.rpc_request_timeout_secs))
-            .pool_max_idle_per_host(5)
-            .pool_idle_timeout(Duration::from_secs(30))
-            .tcp_keepalive(Duration::from_secs(60))
-            .build()
-            .expect("Failed to build HTTP client");
+    pub fn new(config: &Config) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(config.rpc_connect_timeout_secs))
+                .timeout(Duration::from_secs(config.rpc_request_timeout_secs))
+                .pool_max_idle_per_host(5)
+                .pool_idle_timeout(Duration::from_secs(30))
+                .tcp_keepalive(Duration::from_secs(60)),
+            "RPC",
+        )?;
 
         let mut headers = reqwest::header::HeaderMap::new();
         for (name, value) in &config.rpc_headers {
             let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-                .unwrap_or_else(|_| panic!("Invalid RPC header name: {name}"));
-            let header_value = reqwest::header::HeaderValue::from_str(value)
-                .unwrap_or_else(|_| panic!("Invalid RPC header value for '{name}'"));
+                .map_err(|_| {
+                    crate::error::InitError::invalid_config("RPC", format!("invalid header name: {name}"))
+                })?;
+            let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                crate::error::InitError::invalid_config("RPC", format!("invalid header value for '{name}'"))
+            })?;
             headers.insert(header_name, header_value);
         }
 
@@ -107,13 +111,13 @@ impl SorobanRpcClient {
         urls.extend_from_slice(&config.stellar_rpc_fallback_urls);
         let n = urls.len();
 
-        Self {
+        Ok(Self {
             client,
             headers,
             urls,
             active_idx: std::sync::atomic::AtomicUsize::new(0),
             error_counts: (0..n).map(|_| AtomicU64::new(0)).collect(),
-        }
+        })
     }
 
     /// Return the URL to use next, applying round-robin failover.
@@ -322,7 +326,9 @@ pub struct Indexer<R: RpcClient> {
     event_counter: AtomicU64,
     bloom_filter: Option<Arc<EventBloomFilter>>,
     /// Issue #615: session-level bloom filter reset on each new ledger.
-    session_bloom: SessionBloomFilter,
+    /// `None` only if the filter could not be built; the DB unique constraint
+    /// remains the authoritative dedup guard in that case.
+    session_bloom: Option<SessionBloomFilter>,
     kinesis_publisher: Option<Arc<dyn KinesisPublisher>>,
     pubsub_publisher: Option<Arc<dyn PubSubPublisher>>,
     sqs_publisher: Option<Arc<dyn crate::sqs::SqsPublisher>>,
@@ -353,7 +359,9 @@ impl<R: RpcClient> Indexer<R> {
             event_tx: None,
             event_counter: AtomicU64::new(0),
             bloom_filter: None,
-            session_bloom: SessionBloomFilter::new(50_000, 0.001),
+            session_bloom: SessionBloomFilter::new(50_000, 0.001)
+                .map_err(|e| warn!(error = %e, "Session bloom filter disabled"))
+                .ok(),
             kinesis_publisher: None,
             pubsub_publisher: None,
             sqs_publisher: None,
@@ -1152,12 +1160,9 @@ impl<R: RpcClient> Indexer<R> {
         schema_version: i32,
     ) -> Result<u64, anyhow::Error> {
         // Issue #615: session-level bloom filter pre-filter (reset on new ledger)
-        if self.session_bloom.check_and_set(
-            &event.tx_hash,
-            &event.contract_id,
-            &event.event_type,
-            event.ledger,
-        ) {
+        if self.session_bloom.as_ref().is_some_and(|bloom| {
+            bloom.check_and_set(&event.tx_hash, &event.contract_id, &event.event_type, event.ledger)
+        }) {
             return Ok(0);
         }
 

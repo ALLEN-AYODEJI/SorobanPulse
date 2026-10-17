@@ -42,61 +42,61 @@ impl CostCalculator {
 
     /// Replace the default database pricing rates.
     pub fn with_db_rates(self, rates: DatabaseRates) -> Self {
-        self.inner.write().unwrap().db_rates = rates;
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).db_rates = rates;
         self
     }
 
     /// Replace the default compute pricing rates.
     pub fn with_compute_rates(self, rates: ComputeRates) -> Self {
-        self.inner.write().unwrap().compute_rates = rates;
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).compute_rates = rates;
         self
     }
 
     /// Record database cost for the given usage snapshot over `hours`.
     pub fn record_database(&self, usage: &DatabaseUsage, hours: f64) {
         let (db_cost, entry) = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             let db_cost = database::calculate(usage, &inner.db_rates, hours);
             let entry = database::to_cost_entry(&db_cost, "primary-database");
             (db_cost, entry)
         };
         let _ = db_cost; // suppress unused warning; cost is embedded in entry
-        self.inner.write().unwrap().entries.push(entry);
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).entries.push(entry);
     }
 
     /// Record compute cost for the given usage snapshot over `hours`.
     pub fn record_compute(&self, usage: &ComputeUsage, hours: f64) {
         let (compute_cost, entry) = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             let compute_cost = compute::calculate(usage, &inner.compute_rates, hours);
             let entry = compute::to_cost_entry(&compute_cost, "application-server");
             (compute_cost, entry)
         };
         let _ = compute_cost;
-        self.inner.write().unwrap().entries.push(entry);
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).entries.push(entry);
     }
 
     /// Add an arbitrary pre-computed cost entry (e.g. network, storage).
     pub fn record_entry(&self, entry: CostEntry) {
-        self.inner.write().unwrap().entries.push(entry);
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).entries.push(entry);
     }
 
     /// Update the running event and request counters (used for efficiency metrics).
     pub fn update_counters(&self, events: u64, requests: u64) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.event_count += events;
         inner.request_count += requests;
     }
 
     /// Compute a cost breakdown aggregated across all recorded entries.
     pub fn breakdown(&self) -> CostBreakdown {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         build_breakdown(&inner.entries)
     }
 
     /// Generate a cost report over the entries recorded since the given start time.
     pub fn report(&self, period_start: chrono::DateTime<Utc>) -> CostReport {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let period_entries: Vec<CostEntry> = inner
             .entries
             .iter()
@@ -133,7 +133,7 @@ impl CostCalculator {
 
     /// Compute efficiency metrics (cost-per-event, cost-per-request, etc.).
     pub fn metrics(&self) -> CostMetrics {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let breakdown = build_breakdown(&inner.entries);
         let total = breakdown.total;
 
@@ -166,14 +166,14 @@ impl CostCalculator {
         let cutoff = Utc::now() - chrono::Duration::hours(retain_hours);
         self.inner
             .write()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
             .retain(|e| e.timestamp >= cutoff);
     }
 
     /// Total number of recorded cost entries.
     pub fn entry_count(&self) -> usize {
-        self.inner.read().unwrap().entries.len()
+        self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner).entries.len()
     }
 }
 
@@ -217,10 +217,9 @@ fn build_breakdown(entries: &[CostEntry]) -> CostBreakdown {
 }
 
 fn hourly_rate_from_entries(entries: &[CostEntry]) -> f64 {
-    if entries.is_empty() {
+    let Some(oldest) = entries.iter().map(|e| e.timestamp).min() else {
         return 0.0;
-    }
-    let oldest = entries.iter().map(|e| e.timestamp).min().unwrap();
+    };
     let hours = (Utc::now() - oldest).num_minutes() as f64 / 60.0;
     if hours < 0.001 {
         return 0.0;

@@ -765,13 +765,10 @@ impl PaginationParams {
 
         // All three must be provided together or none at all
         if has_lat || has_lon || has_radius {
-            if !has_lat || !has_lon || !has_radius {
+            let (Some(lat), Some(lon), Some(radius)) = (self.near_lat, self.near_lon, self.radius_km)
+            else {
                 return Err("near_lat, near_lon, and radius_km must all be provided together".to_string());
-            }
-
-            let lat = self.near_lat.unwrap();
-            let lon = self.near_lon.unwrap();
-            let radius = self.radius_km.unwrap();
+            };
 
             // Validate latitude range
             if lat < -90.0 || lat > 90.0 {

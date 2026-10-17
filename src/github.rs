@@ -24,18 +24,18 @@ pub struct GitHubClient {
 }
 
 impl GitHubClient {
-    pub fn new(access_token: String, owner: String, repository: String) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build GitHub HTTP client");
+    pub fn new(access_token: String, owner: String, repository: String) -> Result<Self, crate::error::InitError> {
+        let client = crate::net::outbound::build_http_client(
+            Client::builder().timeout(Duration::from_secs(10)),
+            "github",
+        )?;
 
-        Self {
+        Ok(Self {
             client,
             access_token,
             repository,
             owner,
-        }
+        })
     }
 
     /// Create a GitHub issue for an event
@@ -269,7 +269,8 @@ mod tests {
             "test-token".to_string(),
             "test-owner".to_string(),
             "test-repo".to_string(),
-        );
+        )
+        .unwrap();
 
         assert_eq!(client.access_token, "test-token");
         assert_eq!(client.owner, "test-owner");

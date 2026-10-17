@@ -1,3 +1,6 @@
+// Issue #1246: a panic in production is a silent availability incident.
+// Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 mod audit_logging;
 mod bloom_filter;
 mod compliance_report;
@@ -90,6 +93,8 @@ use opentelemetry_otlp::WithExportConfig;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetryLayer;
 
+use anyhow::Context;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -112,7 +117,7 @@ async fn main() -> anyhow::Result<()> {
                     .with_endpoint(otel_endpoint),
             )
             .install_simple()
-            .expect("Failed to initialize OpenTelemetry tracer");
+            .context("Failed to initialize OpenTelemetry tracer")?;
 
         registry.with(OpenTelemetryLayer::new(tracer))
     };
@@ -296,7 +301,7 @@ async fn main() -> anyhow::Result<()> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("Failed to build webhook HTTP client");
+            .context("Failed to build webhook HTTP client")?;
 
         info!(
             url = %webhook_url,
@@ -525,7 +530,7 @@ async fn main() -> anyhow::Result<()> {
     let sse_ring_buf = sse_ring_buffer::SseRingBuffer::new(config.sse_ring_buffer_capacity);
 
     // Build and wire up the indexer only when this instance is configured to run it.
-    let rpc_client = indexer::SorobanRpcClient::new(&config);
+    let rpc_client = indexer::SorobanRpcClient::new(&config)?;
     let mut indexer = indexer::Indexer::new(
         pool.clone(),
         config.clone(),
@@ -542,7 +547,7 @@ async fn main() -> anyhow::Result<()> {
         let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(
             config.bloom_filter_capacity,
             config.bloom_filter_fp_rate,
-        ));
+        )?);
         match bloom_filter::seed_from_db(&bloom, &pool, 100_000).await {
             Ok(n) => info!(seeded = n, "Bloom filter seeded from DB"),
             Err(e) => tracing::warn!(error = %e, "Failed to seed bloom filter from DB"),
@@ -673,7 +678,13 @@ async fn main() -> anyhow::Result<()> {
             network_config.chain_id = target.chain_id.clone();
             network_config.stellar_rpc_url = target.rpc_url.clone();
 
-            let network_rpc_client = indexer::SorobanRpcClient::new(&network_config);
+            let network_rpc_client = match indexer::SorobanRpcClient::new(&network_config) {
+                Ok(client) => client,
+                Err(e) => {
+                    error!(chain_id = %target.chain_id, error = %e, "Skipping additional network indexer");
+                    continue;
+                }
+            };
             let mut network_indexer = indexer::Indexer::new(
                 pool.clone(),
                 network_config,
@@ -740,7 +751,7 @@ async fn main() -> anyhow::Result<()> {
         let health_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .expect("Failed to build health check HTTP client");
+            .context("Failed to build health check HTTP client")?;
         let interval_secs = config.notification_health_check_interval_secs;
         let health_check_email = config.notification_health_check_email.clone();
         notification_admin::spawn_channel_health_checker(
@@ -783,11 +794,18 @@ async fn main() -> anyhow::Result<()> {
     ) {
         #[cfg(unix)]
         {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = sigterm.recv() => {},
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = sigterm.recv() => {},
+                    }
+                }
+                Err(e) => {
+                    // Without a SIGTERM handler we can still shut down on Ctrl-C.
+                    tracing::warn!(error = %e, "Failed to install SIGTERM handler; listening for Ctrl-C only");
+                    tokio::signal::ctrl_c().await.ok();
+                }
             }
         }
 

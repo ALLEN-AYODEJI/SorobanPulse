@@ -531,7 +531,9 @@ pub fn create_router_with_tx_and_tenant_map(
     // Build governor config: burst = rate_limit_per_minute, replenish 1 token per (60/rate) seconds.
     // per_second(n) means n tokens replenished per second; we want rate_limit_per_minute / 60.
     // Use per_millisecond to avoid integer truncation: replenish 1 token every (60_000 / rate) ms.
-    let replenish_ms = 60_000u64 / u64::from(rate_limit_per_minute.max(1));
+    // Clamp to >= 1 ms: a zero period makes `GovernorConfigBuilder::finish`
+    // return `None` (limits above 60 000/min would otherwise round to 0).
+    let replenish_ms = (60_000u64 / u64::from(rate_limit_per_minute.max(1))).max(1);
     let burst = rate_limit_per_minute.max(1);
 
     // Admin routes (issue #409): gated by a dedicated admin auth layer in
@@ -814,64 +816,79 @@ pub fn create_router_with_tx_and_tenant_map(
         let effective_limit = config
             .tenant_rate_limit_per_minute
             .unwrap_or(rate_limit_per_minute);
-        let replenish_ms_t = 60_000u64 / u64::from(effective_limit.max(1));
+        let replenish_ms_t = (60_000u64 / u64::from(effective_limit.max(1))).max(1);
         let burst_t = effective_limit.max(1);
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms_t)
-                .burst_size(burst_t)
-                .key_extractor(ApiKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms_t)
+            .burst_size(burst_t)
+            .key_extractor(ApiKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     } else if behind_proxy {
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms)
-                .burst_size(burst)
-                .key_extractor(SmartIpKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms)
+            .burst_size(burst)
+            .key_extractor(SmartIpKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     } else {
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms)
-                .burst_size(burst)
-                .key_extractor(PeerIpKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms)
+            .burst_size(burst)
+            .key_extractor(PeerIpKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     };
 
     // Issue #1112: static dashboard at /ui — outside auth-gated rate limiting.

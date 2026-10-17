@@ -817,7 +817,10 @@ pub async fn acknowledge_pagerduty_incident(
 
     let mut config = crate::pagerduty::PagerDutyConfig::default();
     config.routing_key = integration_secrets::open(&routing_key).map_err(secret_error)?;
-    let client = crate::pagerduty::PagerDutyClient::new(config);
+    let client = crate::pagerduty::PagerDutyClient::new(config).map_err(|e| {
+        error!(error = %e, "Failed to build PagerDuty client");
+        (StatusCode::INTERNAL_SERVER_ERROR, "PagerDuty client unavailable".to_string())
+    })?;
 
     client
         .acknowledge_incident(
@@ -872,7 +875,10 @@ pub async fn resolve_pagerduty_incident(
 
     let mut config = crate::pagerduty::PagerDutyConfig::default();
     config.routing_key = integration_secrets::open(&routing_key).map_err(secret_error)?;
-    let client = crate::pagerduty::PagerDutyClient::new(config);
+    let client = crate::pagerduty::PagerDutyClient::new(config).map_err(|e| {
+        error!(error = %e, "Failed to build PagerDuty client");
+        (StatusCode::INTERNAL_SERVER_ERROR, "PagerDuty client unavailable".to_string())
+    })?;
 
     client
         .resolve_incident(&req.dedup_key, Some(&pool))
