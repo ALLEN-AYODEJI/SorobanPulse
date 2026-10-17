@@ -256,6 +256,11 @@ pub struct Config {
     pub rpc_request_timeout_secs: u64,
     pub allowed_origins: Vec<String>,
     pub rate_limit_per_minute: u32,
+    /// Per-IP rate limit for `POST /v1/subscriptions` (Issue #1268).
+    /// Stricter than the global `rate_limit_per_minute` to prevent DB
+    /// connection exhaustion via subscription spam. Set via
+    /// SUBSCRIPTION_RATE_LIMIT_PER_MINUTE (default 5).
+    pub subscription_rate_limit_per_minute: u32,
     /// Per-API-key rate limit: max requests per minute (Issue #669).
     /// When set, each API key gets its own sliding-window quota stored in the
     /// `rate_limit_counters` table. `None` disables per-key enforcement.
@@ -407,7 +412,7 @@ pub struct Config {
     // Issue #325: SSE Last-Event-ID replay limit
     pub sse_replay_limit: u64,
     // Issue #454: SSE_REPLAY_MAX_EVENTS (alias for sse_replay_limit, read from SSE_REPLAY_MAX_EVENTS env var)
-    // Issue #453: Per-IP SSE connection limit
+    // Issue #453 / #1268: Per-IP SSE connection limit
     pub sse_max_connections_per_ip: usize,
     // Issue #451: Max lag before disconnect
     pub sse_max_lag_before_disconnect: u64,
@@ -561,6 +566,12 @@ pub struct Config {
     /// Deployment role: controls which subsystems start on this instance.
     /// Set via `ROLE=all|api|indexer`. Default: `all` (backward-compatible).
     pub role: Role,
+
+    // Issue #1271: callback URL allowlist
+    /// Domains permitted as OAuth/integration callback URLs (GitHub, Slack,
+    /// Telegram). Comma-separated, set via ALLOWED_CALLBACK_DOMAINS. When
+    /// empty, callback URL validation is disabled (development default).
+    pub allowed_callback_domains: Vec<String>,
 }
 
 impl Default for Config {
@@ -586,6 +597,7 @@ impl Default for Config {
             rpc_request_timeout_secs: 30,
             allowed_origins: vec!["*".to_string()],
             rate_limit_per_minute: 60,
+            subscription_rate_limit_per_minute: 5,
             rate_limit_key_per_minute: None,
             rate_limit_key_per_hour: None,
             rate_limit_key_per_day: None,
@@ -661,7 +673,7 @@ impl Default for Config {
             retention_days: 90,
             pruning_interval_hours: 24,
             sse_replay_limit: 1000,
-            sse_max_connections_per_ip: 10,
+            sse_max_connections_per_ip: 5,
             sse_max_lag_before_disconnect: 0, // 0 = disabled
             indexer_ignore_checkpoint: false,
             webhook_require_https: false,
@@ -740,6 +752,7 @@ impl Default for Config {
             ml_confidence_threshold: 0.8,
             ml_auto_retrain: true,
             role: Role::All,
+            allowed_callback_domains: Vec::new(),
         }
     }
 }
@@ -1237,6 +1250,17 @@ impl Config {
         )
         .unwrap_or(60);
 
+        // Issue #1268: stricter per-IP limit for POST /v1/subscriptions.
+        let subscription_rate_limit_per_minute = parse_int_range::<u32>(
+            "SUBSCRIPTION_RATE_LIMIT_PER_MINUTE",
+            &env_or_file_or("SUBSCRIPTION_RATE_LIMIT_PER_MINUTE", &file, "5"),
+            1,
+            u32::MAX,
+            "5",
+            &mut errors,
+        )
+        .unwrap_or(5);
+
         // Issue #669 / #666: Per-API-key rate limits (optional, sliding window).
         let rate_limit_key_per_minute = env_or_file("RATE_LIMIT_KEY_PER_MINUTE", &file)
             .and_then(|v| parse_int::<u32>("RATE_LIMIT_KEY_PER_MINUTE", &v, "1000", &mut errors))
@@ -1338,6 +1362,17 @@ impl Config {
             &mut errors,
         )
         .unwrap_or(1000);
+
+        // Issue #1268: per-IP SSE connection limit.
+        let sse_max_connections_per_ip = parse_int_range::<usize>(
+            "SSE_MAX_CONNECTIONS_PER_IP",
+            &env_or_file_or("SSE_MAX_CONNECTIONS_PER_IP", &file, "5"),
+            1,
+            usize::MAX,
+            "5",
+            &mut errors,
+        )
+        .unwrap_or(5);
 
         let sse_drain_timeout_secs = parse_int_range::<u64>(
             "SSE_DRAIN_TIMEOUT_SECS",
@@ -1480,6 +1515,36 @@ impl Config {
         let rpc_headers = parse_rpc_headers_checked(&mut errors);
         let indexer_event_types = parse_indexer_event_types_checked(&mut errors);
 
+        // Issue #1271: callback URL allowlist (comma-separated domains).
+        let allowed_callback_domains: Vec<String> = env_or_file_or(
+            "ALLOWED_CALLBACK_DOMAINS",
+            &file,
+            "",
+        )
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            // Accept either a bare domain ("app.example.com") or a full URL
+            // ("https://app.example.com/callback"); store just the host.
+            let host = match Url::parse(&s) {
+                Ok(u) => u.host_str().map(|h| h.to_string()),
+                Err(_) => Some(s.clone()),
+            };
+            match host {
+                Some(h) if !h.is_empty() => h,
+                _ => {
+                    errors.push(format!(
+                        "  ALLOWED_CALLBACK_DOMAINS contains an invalid entry {s:?}. \
+                         Expected a domain (e.g., app.example.com) or URL."
+                    ));
+                    String::new()
+                }
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+
         // Report all errors at once, then exit with code 1 so operators get a
         // clear, deterministic startup failure (a panic would exit with 101).
         if !errors.is_empty() {
@@ -1533,6 +1598,7 @@ impl Config {
             rpc_request_timeout_secs,
             allowed_origins,
             rate_limit_per_minute,
+            subscription_rate_limit_per_minute,
             rate_limit_key_per_minute,
             rate_limit_key_per_hour,
             rate_limit_key_per_day,
@@ -1689,9 +1755,7 @@ impl Config {
                 .or_else(|| env_or_file("SSE_REPLAY_LIMIT", &file))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000),
-            sse_max_connections_per_ip: env_or_file("SSE_MAX_CONNECTIONS_PER_IP", &file)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
+            sse_max_connections_per_ip,
             sse_max_lag_before_disconnect: env_or_file("SSE_MAX_LAG_BEFORE_DISCONNECT", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
@@ -1919,6 +1983,7 @@ impl Config {
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or(true),
             role: Role::from_str(&env_or_file_or("ROLE", &file, "all")),
+            allowed_callback_domains,
         }
     }
 }
