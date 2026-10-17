@@ -750,7 +750,8 @@ impl PaginationParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
         let limit = self.limit();
-        (page - 1) * limit
+        // Saturate so a huge `page` (e.g. i64::MAX) cannot overflow and panic.
+        (page - 1).saturating_mul(limit)
     }
 
     pub fn limit(&self) -> i64 {
@@ -962,6 +963,12 @@ mod tests {
     #[test]
     fn page_3_limit_10_offset_is_20() {
         assert_eq!(params(Some(3), Some(10)).offset(), 20);
+    }
+
+    #[test]
+    fn page_max_offset_saturates_instead_of_overflowing() {
+        assert_eq!(params(Some(i64::MAX), Some(100)).offset(), i64::MAX);
+        assert_eq!(params(Some(i64::MAX), None).offset(), i64::MAX);
     }
 
     // --- RPC deserialization fixture tests ---
