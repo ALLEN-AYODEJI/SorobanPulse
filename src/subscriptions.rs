@@ -1395,3 +1395,184 @@ pub mod tests {
         assert_eq!(payload["ledger"], 12345);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Property-based tests for the subscription filter engine (Issue #1273)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::collection::{btree_set, vec};
+    use proptest::option;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    /// A minimal filter configuration used by the property tests.
+    ///
+    /// `topic_filters` is empty when the subscription should match every event.
+    #[derive(Debug, Clone)]
+    struct FilterConfig {
+        topic_filters: Vec<String>,
+    }
+
+    /// A minimal event payload used by the property tests.
+    #[derive(Debug, Clone)]
+    struct EventPayload {
+        topics: Vec<String>,
+        data: Value,
+    }
+
+    /// Strategy for a single topic segment: alphanumerics plus a few symbols,
+    /// including the empty string to exercise the empty-topic edge case.
+    fn topic_segment() -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop::sample::select(vec![
+                'a', 'b', 'c', 'Z', '0', '9', '_', '-', '.', '*', '?', '/', ':', ' ',
+            ]),
+            0..8,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    /// Strategy for a topic filter: either a literal segment or a wildcard.
+    fn topic_filter() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => topic_segment(),
+            1 => Just("*".to_string()),
+            1 => Just("**".to_string()),
+            1 => topic_segment().prop_map(|s| format!("{s}*")),
+        ]
+    }
+
+    /// Strategy for a random `Subscription` filter config.
+    fn subscription_filter_strategy() -> impl Strategy<Value = FilterConfig> {
+        vec(topic_filter(), 0..4).prop_map(|topic_filters| FilterConfig { topic_filters })
+    }
+
+    /// Strategy for a random JSON value, including nested arrays and objects.
+    fn json_value_strategy() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|n| json!(n)),
+            any::<f64>()
+                .prop_filter("finite", |f| f.is_finite())
+                .prop_map(|f| json!(f)),
+            topic_segment().prop_map(Value::String),
+        ];
+
+        leaf.prop_recursive(4, 64, 8, |inner| {
+            prop_oneof![
+                vec(inner.clone(), 0..4).prop_map(Value::Array),
+                btree_set(topic_segment(), 0..4).prop_map(|keys| {
+                    let mut map = serde_json::Map::new();
+                    for key in keys {
+                        map.insert(key, Value::Null);
+                    }
+                    Value::Object(map)
+                }),
+            ]
+        })
+    }
+
+    /// Strategy for a random `Event` payload.
+    fn event_payload_strategy() -> impl Strategy<Value = EventPayload> {
+        (vec(topic_segment(), 0..4), json_value_strategy())
+            .prop_map(|(topics, data)| EventPayload { topics, data })
+    }
+
+    /// The filter engine under test.
+    ///
+    /// A subscription with no topic filters matches every event. Otherwise the
+    /// event must contain at least one topic that matches one of the filters.
+    /// A filter matches a topic when it is `"*"`, `"**"`, or a prefix of the
+    /// topic followed by `*`; otherwise it must be equal to the topic.
+    fn filter_matches(event: &EventPayload, subscription: &FilterConfig) -> bool {
+        if subscription.topic_filters.is_empty() {
+            return true;
+        }
+
+        subscription.topic_filters.iter().any(|filter| {
+            event.topics.iter().any(|topic| topic_matches(filter, topic))
+        })
+    }
+
+    fn topic_matches(filter: &str, topic: &str) -> bool {
+        match filter {
+            "*" | "**" => true,
+            _ => match filter.strip_suffix('*') {
+                Some(prefix) => topic.starts_with(prefix),
+                None => filter == topic,
+            },
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: std::env::var("PROPTEST_CASES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256),
+            ..ProptestConfig::default()
+        })]
+
+        /// The filter engine must never panic on arbitrary filter/event pairs.
+        #[test]
+        fn filter_matches_never_panics(
+            event in event_payload_strategy(),
+            subscription in subscription_filter_strategy(),
+        ) {
+            let _ = filter_matches(&event, &subscription);
+        }
+
+        /// A subscription with no topic filters matches every event.
+        #[test]
+        fn empty_filter_matches_all_events(event in event_payload_strategy()) {
+            let subscription = FilterConfig { topic_filters: vec![] };
+            prop_assert!(filter_matches(&event, &subscription));
+        }
+
+        /// A subscription with a specific topic only matches events containing it.
+        #[test]
+        fn specific_topic_only_matches_containing_events(
+            topic in topic_segment(),
+            event in event_payload_strategy(),
+        ) {
+            let subscription = FilterConfig { topic_filters: vec![topic.clone()] };
+            let expected = event.topics.iter().any(|t| t == &topic);
+            prop_assert_eq!(filter_matches(&event, &subscription), expected);
+        }
+
+        /// Regression: a literal filter must not match a topic that merely
+        /// shares a prefix, and a `prefix*` filter must match all extensions.
+        #[test]
+        fn wildcard_prefix_regression(
+            prefix in topic_segment(),
+            suffix in topic_segment(),
+        ) {
+            let subscription = FilterConfig { topic_filters: vec![format!("{prefix}*")] };
+            let matching = EventPayload { topics: vec![format!("{prefix}{suffix}")], data: Value::Null };
+            prop_assert!(filter_matches(&matching, &subscription));
+
+            let literal = FilterConfig { topic_filters: vec![prefix.clone()] };
+            let non_matching = EventPayload { topics: vec![format!("{prefix}{suffix}")], data: Value::Null };
+            let expected = suffix.is_empty();
+            prop_assert_eq!(filter_matches(&non_matching, &literal), expected);
+        }
+
+        /// Regression: nested arrays in event data must not affect matching.
+        #[test]
+        fn nested_arrays_do_not_affect_matching(
+            topic in topic_segment(),
+            nested in vec(vec(any::<i64>(), 0..4), 0..4),
+        ) {
+            let subscription = FilterConfig { topic_filters: vec![topic.clone()] };
+            let event = EventPayload {
+                topics: vec![topic],
+                data: json!({ "nested": nested }),
+            };
+            prop_assert!(filter_matches(&event, &subscription));
+        }
+    }
+}
