@@ -93,6 +93,10 @@ make check-migrations
 
 This ensures no two migration files share the same timestamp prefix. The CI pipeline also runs this check automatically.
 
+### Rollback (`.down.sql`) files
+
+Every forward migration `<timestamp>_<name>.sql` must ship with a matching `<timestamp>_<name>.down.sql` that reverses it (at minimum `DROP TABLE IF EXISTS` / `DROP INDEX IF EXISTS` / `ALTER TABLE ... DROP COLUMN IF EXISTS`). `make check-migrations` (`scripts/check-migrations.sh`) fails if any migration lacks a down file, and CI runs it on every pull request.
+
 ### Example
 
 ```

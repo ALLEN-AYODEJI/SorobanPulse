@@ -805,7 +805,7 @@ pub fn spawn(
     interval_hours: u64,
     mut shutdown_rx: watch::Receiver<bool>,
     thresholds: FragmentationThresholds,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_hours * 3600);
         // Run once shortly after startup, then on the configured interval.
@@ -829,7 +829,7 @@ pub fn spawn(
                 }
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -209,10 +209,19 @@ pub fn spawn_pool_monitor(
     pool: PgPool,
     config: PoolMonitorConfig,
 ) -> Arc<PoolStats> {
+    spawn_pool_monitor_with_handle(pool, config).0
+}
+
+/// Like [`spawn_pool_monitor`], but also returns the task's `JoinHandle` so
+/// it can be registered with the `JobScheduler` (issue #1248).
+pub fn spawn_pool_monitor_with_handle(
+    pool: PgPool,
+    config: PoolMonitorConfig,
+) -> (Arc<PoolStats>, tokio::task::JoinHandle<()>) {
     let stats = PoolStats::new();
     let stats_clone = Arc::clone(&stats);
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(config.sample_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -272,7 +281,7 @@ pub fn spawn_pool_monitor(
         }
     });
 
-    stats
+    (stats, handle)
 }
 
 /// Acquire a connection from the pool and record the latency.

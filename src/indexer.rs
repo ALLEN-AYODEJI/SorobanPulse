@@ -1277,10 +1277,15 @@ impl<R: RpcClient> Indexer<R> {
         let op_index = ordinal.map(|o| o.op_index);
         let event_index = ordinal.map(|o| o.event_index);
 
-        let result = sqlx::query(
-            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint, event_data_compressed, compression_algo, chain_id, tx_index, op_index, event_index)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-               ON CONFLICT (tx_hash, contract_id, event_type) DO NOTHING"#,
+        // Issue #1251: typed SEP-41 columns; issue #1250: address index rows.
+        let sep41 = crate::sep41::decode_event_data(&event_data);
+        let addresses = crate::account_events::extract_addresses(&event_data);
+
+        let inserted_id: Option<uuid::Uuid> = sqlx::query_scalar(
+            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint, event_data_compressed, compression_algo, chain_id, tx_index, op_index, event_index, sep41_event_type, sep41_from, sep41_to, sep41_amount)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21::numeric)
+               ON CONFLICT (tx_hash, contract_id, event_type) DO NOTHING
+               RETURNING id"#,
         )
         .bind(&event.contract_id)
         .bind(&event.event_type)
@@ -1299,10 +1304,28 @@ impl<R: RpcClient> Indexer<R> {
         .bind(tx_index)
         .bind(op_index)
         .bind(event_index)
-        .execute(&mut **tx)
+        .bind(sep41.as_ref().map(|e| e.event_type.as_str()))
+        .bind(sep41.as_ref().and_then(|e| e.from.as_deref()))
+        .bind(sep41.as_ref().and_then(|e| e.to.as_deref()))
+        .bind(sep41.as_ref().map(|e| e.amount.as_str()))
+        .fetch_optional(&mut **tx)
         .await?;
 
-        let rows = result.rows_affected();
+        if let Some(id) = inserted_id {
+            for (address, position) in &addresses {
+                sqlx::query(
+                    "INSERT INTO event_addresses (event_id, address, position, ledger) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                )
+                .bind(id)
+                .bind(address)
+                .bind(position)
+                .bind(ledger)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+
+        let rows = u64::from(inserted_id.is_some());
         if rows > 0 {
             metrics::record_fingerprint_stored();
             // Record in bloom filter after successful insert
