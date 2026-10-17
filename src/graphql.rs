@@ -4,12 +4,14 @@
 use async_graphql::{
     Context, InputObject, Object, Schema, Subscription, ID, SimpleObject,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
 use futures_util::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 use crate::models::SorobanEvent;
 
@@ -64,13 +66,57 @@ pub struct EventFilter {
     pub topic_contains: Option<String>,
 }
 
-/// Pagination input for GraphQL queries
-#[derive(Debug, InputObject, Clone)]
-pub struct PaginationInput {
-    /// Maximum number of results to return (default: 10, max: 100)
-    pub first: Option<i32>,
-    /// Cursor for pagination
-    pub after: Option<String>,
+/// Relay-style page information
+#[derive(Debug, Clone, SimpleObject)]
+pub struct PageInfo {
+    /// Whether there are more edges after the last returned edge
+    pub has_next_page: bool,
+    /// Whether there are more edges before the first returned edge
+    pub has_previous_page: bool,
+    /// Cursor of the first returned edge
+    pub start_cursor: Option<String>,
+    /// Cursor of the last returned edge
+    pub end_cursor: Option<String>,
+}
+
+/// Relay-style edge wrapping a node with its cursor
+#[derive(Debug, Clone, SimpleObject)]
+pub struct Edge<T: OutputType> {
+    /// Opaque cursor identifying this edge
+    pub cursor: String,
+    /// The underlying node
+    pub node: T,
+}
+
+/// Relay-style connection of edges plus page info
+#[derive(Debug, Clone, SimpleObject)]
+pub struct Connection<T: OutputType> {
+    pub edges: Vec<Edge<T>>,
+    pub page_info: PageInfo,
+}
+
+/// Encode a cursor as base64("ledger:uuid")
+pub fn encode_cursor(ledger: u64, id: &str) -> String {
+    BASE64.encode(format!("{}:{}", ledger, id))
+}
+
+/// Decode a cursor of the form base64("ledger:uuid")
+pub fn decode_cursor(cursor: &str) -> async_graphql::Result<(u64, String)> {
+    let decoded = BASE64
+        .decode(cursor)
+        .map_err(|_| async_graphql::Error::new("Invalid cursor encoding"))?;
+    let decoded = String::from_utf8(decoded)
+        .map_err(|_| async_graphql::Error::new("Invalid cursor encoding"))?;
+    let (ledger, id) = decoded
+        .split_once(':')
+        .ok_or_else(|| async_graphql::Error::new("Invalid cursor format"))?;
+    let ledger = ledger
+        .parse::<u64>()
+        .map_err(|_| async_graphql::Error::new("Invalid cursor ledger"))?;
+    if id.is_empty() {
+        return Err(async_graphql::Error::new("Invalid cursor id"));
+    }
+    Ok((ledger, id.to_string()))
 }
 
 /// Query root for GraphQL API
@@ -104,19 +150,53 @@ impl Query {
         }))
     }
 
-    /// Query events with optional filters and pagination
+    /// Query events with optional filters using Relay-style cursor pagination.
+    ///
+    /// Forward pagination: `first` + `after`. Backward pagination: `last` + `before`.
+    /// Ordering is by (ledger DESC, id DESC); cursors encode `base64("ledger:uuid")`.
     async fn events(
         &self,
         ctx: &Context<'_>,
         filter: Option<EventFilter>,
-        pagination: Option<PaginationInput>,
-    ) -> async_graphql::Result<Vec<Event>> {
+        first: Option<i32>,
+        after: Option<String>,
+        last: Option<i32>,
+        before: Option<String>,
+    ) -> async_graphql::Result<Connection<Event>> {
         let pool = ctx.data::<PgPool>()?;
         let filter = filter.unwrap_or_default();
-        let pagination = pagination.unwrap_or_default();
 
-        let limit = std::cmp::min(pagination.first.unwrap_or(10) as i64, 100);
-        let offset = 0i64; // In a real implementation, parse cursor for offset
+        if first.is_some() && last.is_some() {
+            return Err(async_graphql::Error::new(
+                "Cannot specify both `first` and `last`",
+            ));
+        }
+        if first.is_some() && before.is_some() {
+            return Err(async_graphql::Error::new(
+                "Cannot specify both `first` and `before`",
+            ));
+        }
+        if last.is_some() && after.is_some() {
+            return Err(async_graphql::Error::new(
+                "Cannot specify both `last` and `after`",
+            ));
+        }
+
+        let backward = last.is_some();
+        let requested = if backward { last } else { first }.unwrap_or(10);
+        if requested < 0 {
+            return Err(async_graphql::Error::new("Pagination count must be non-negative"));
+        }
+        let limit = std::cmp::min(requested as i64, 100);
+
+        let after_cursor = match after.as_deref() {
+            Some(c) => Some(decode_cursor(c)?),
+            None => None,
+        };
+        let before_cursor = match before.as_deref() {
+            Some(c) => Some(decode_cursor(c)?),
+            None => None,
+        };
 
         let mut query = String::from(
             "SELECT id, contract_id, event_type, tx_hash, ledger, ledger_close_time, topic, value, source_account FROM events WHERE 1=1"
@@ -145,10 +225,33 @@ impl Query {
             query.push_str(&format!(" AND source_account = '{}'", source_account));
         }
 
-        query.push_str(&format!(
-            " ORDER BY ledger DESC LIMIT {} OFFSET {}",
-            limit, offset
-        ));
+        // Cursor-based WHERE clauses on (ledger, id) ordering.
+        if let Some((ledger, id)) = &after_cursor {
+            query.push_str(&format!(
+                " AND (ledger < {} OR (ledger = {} AND id < '{}'))",
+                ledger, ledger, id
+            ));
+        }
+        if let Some((ledger, id)) = &before_cursor {
+            query.push_str(&format!(
+                " AND (ledger > {} OR (ledger = {} AND id > '{}'))",
+                ledger, ledger, id
+            ));
+        }
+
+        // Fetch one extra row to determine whether another page exists.
+        let fetch_limit = limit + 1;
+        if backward {
+            query.push_str(&format!(
+                " ORDER BY ledger ASC, id ASC LIMIT {}",
+                fetch_limit
+            ));
+        } else {
+            query.push_str(&format!(
+                " ORDER BY ledger DESC, id DESC LIMIT {}",
+                fetch_limit
+            ));
+        }
 
         let rows = sqlx::query_as::<_, (String, String, String, String, i32, String, Option<String>, Option<String>, Option<String>)>(
             &query
@@ -156,7 +259,17 @@ impl Query {
         .fetch_all(pool)
         .await?;
 
-        Ok(rows
+        let has_extra = rows.len() as i64 > limit;
+        let mut rows = rows;
+        if has_extra {
+            rows.truncate(limit as usize);
+        }
+        if backward {
+            // Rows were fetched in ascending order; present them in canonical order.
+            rows.reverse();
+        }
+
+        let events: Vec<Event> = rows
             .into_iter()
             .map(|(id, contract_id, event_type, tx_hash, ledger, ledger_close_time, topic, value, source_account)| {
                 Event {
@@ -171,7 +284,34 @@ impl Query {
                     source_account,
                 }
             })
-            .collect())
+            .collect();
+
+        let edges: Vec<Edge<Event>> = events
+            .into_iter()
+            .map(|event| {
+                let cursor = encode_cursor(event.ledger, event.id.as_str());
+                Edge { cursor, node: event }
+            })
+            .collect();
+
+        let (has_next_page, has_previous_page) = if backward {
+            (before_cursor.is_some(), has_extra)
+        } else {
+            (has_extra, after_cursor.is_some())
+        };
+
+        let start_cursor = edges.first().map(|e| e.cursor.clone());
+        let end_cursor = edges.last().map(|e| e.cursor.clone());
+
+        Ok(Connection {
+            edges,
+            page_info: PageInfo {
+                has_next_page,
+                has_previous_page,
+                start_cursor,
+                end_cursor,
+            },
+        })
     }
 
     /// Get event statistics
@@ -295,4 +435,205 @@ impl Subscription {
 pub fn create_schema(
 ) -> Schema<Query, async_graphql::EmptyMutation, Subscription> {
     Schema::build(Query, async_graphql::EmptyMutation, Subscription).finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_event(ledger: u64, id: &str) -> Event {
+        Event {
+            id: ID(id.to_string()),
+            contract_id: "CABC".to_string(),
+            event_type: "transfer".to_string(),
+            tx_hash: "tx".to_string(),
+            ledger,
+            ledger_close_time: Utc::now(),
+            topic: None,
+            value: None,
+            source_account: None,
+        }
+    }
+
+    /// Build a connection the same way the resolver does, from a pre-sorted
+    /// (ledger DESC, id DESC) list of events, to exercise pagination logic.
+    fn paginate(
+        all: &[Event],
+        first: Option<i32>,
+        after: Option<String>,
+        last: Option<i32>,
+        before: Option<String>,
+    ) -> Connection<Event> {
+        let backward = last.is_some();
+        let limit = std::cmp::min(last.or(first).unwrap_or(10) as i64, 100);
+
+        let after_cursor = after.as_deref().map(|c| decode_cursor(c).unwrap());
+        let before_cursor = before.as_deref().map(|c| decode_cursor(c).unwrap());
+
+        let mut filtered: Vec<Event> = all
+            .iter()
+            .filter(|e| {
+                if let Some((ledger, id)) = &after_cursor {
+                    !(e.ledger < *ledger || (e.ledger == *ledger && e.id.as_str() < id.as_str()))
+                } else {
+                    true
+                }
+            })
+            .filter(|e| {
+                if let Some((ledger, id)) = &before_cursor {
+                    !(e.ledger > *ledger || (e.ledger == *ledger && e.id.as_str() > id.as_str()))
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        if backward {
+            filtered.reverse();
+        }
+
+        let has_extra = filtered.len() as i64 > limit;
+        filtered.truncate(limit as usize);
+        if backward {
+            filtered.reverse();
+        }
+
+        let edges: Vec<Edge<Event>> = filtered
+            .into_iter()
+            .map(|event| {
+                let cursor = encode_cursor(event.ledger, event.id.as_str());
+                Edge { cursor, node: event }
+            })
+            .collect();
+
+        let (has_next_page, has_previous_page) = if backward {
+            (before_cursor.is_some(), has_extra)
+        } else {
+            (has_extra, after_cursor.is_some())
+        };
+
+        Connection {
+            edges,
+            page_info: PageInfo {
+                has_next_page,
+                has_previous_page,
+                start_cursor: None,
+                end_cursor: None,
+            },
+        }
+    }
+
+    fn sample_events() -> Vec<Event> {
+        // Canonical order: ledger DESC, id DESC
+        vec![
+            make_event(105, "a"),
+            make_event(104, "c"),
+            make_event(104, "b"),
+            make_event(103, "d"),
+            make_event(102, "e"),
+        ]
+    }
+
+    #[test]
+    fn cursor_round_trip() {
+        let cursor = encode_cursor(42, "abc-123");
+        let (ledger, id) = decode_cursor(&cursor).unwrap();
+        assert_eq!(ledger, 42);
+        assert_eq!(id, "abc-123");
+    }
+
+    #[test]
+    fn invalid_cursor_rejected() {
+        assert!(decode_cursor("not-base64!!").is_err());
+        assert!(decode_cursor(&BASE64.encode("no-colon")).is_err());
+        assert!(decode_cursor(&BASE64.encode("abc:def")).is_err());
+        assert!(decode_cursor(&BASE64.encode("1:")).is_err());
+    }
+
+    #[test]
+    fn forward_pagination_first_page() {
+        let conn = paginate(&sample_events(), Some(2), None, None, None);
+        assert_eq!(conn.edges.len(), 2);
+        assert_eq!(conn.edges[0].node.id.as_str(), "a");
+        assert_eq!(conn.edges[1].node.id.as_str(), "c");
+        assert!(conn.page_info.has_next_page);
+        assert!(!conn.page_info.has_previous_page);
+    }
+
+    #[test]
+    fn forward_pagination_next_page() {
+        let all = sample_events();
+        let first_page = paginate(&all, Some(2), None, None, None);
+        let cursor = first_page.edges.last().unwrap().cursor.clone();
+
+        let second_page = paginate(&all, Some(2), Some(cursor), None, None);
+        assert_eq!(second_page.edges.len(), 2);
+        assert_eq!(second_page.edges[0].node.id.as_str(), "b");
+        assert_eq!(second_page.edges[1].node.id.as_str(), "d");
+        assert!(second_page.page_info.has_next_page);
+        assert!(second_page.page_info.has_previous_page);
+    }
+
+    #[test]
+    fn forward_pagination_last_page_has_no_next() {
+        let all = sample_events();
+        let first_page = paginate(&all, Some(2), None, None, None);
+        let cursor = first_page.edges.last().unwrap().cursor.clone();
+        let second_page = paginate(&all, Some(2), Some(cursor), None, None);
+        let cursor = second_page.edges.last().unwrap().cursor.clone();
+
+        let last_page = paginate(&all, Some(2), Some(cursor), None, None);
+        assert_eq!(last_page.edges.len(), 1);
+        assert_eq!(last_page.edges[0].node.id.as_str(), "e");
+        assert!(!last_page.page_info.has_next_page);
+        assert!(last_page.page_info.has_previous_page);
+    }
+
+    #[test]
+    fn backward_pagination_last_page() {
+        let conn = paginate(&sample_events(), None, None, Some(2), None);
+        assert_eq!(conn.edges.len(), 2);
+        assert_eq!(conn.edges[0].node.id.as_str(), "d");
+        assert_eq!(conn.edges[1].node.id.as_str(), "e");
+        assert!(!conn.page_info.has_next_page);
+        assert!(conn.page_info.has_previous_page);
+    }
+
+    #[test]
+    fn backward_pagination_previous_page() {
+        let all = sample_events();
+        let last_page = paginate(&all, None, None, Some(2), None);
+        let cursor = last_page.edges.first().unwrap().cursor.clone();
+
+        let prev_page = paginate(&all, None, None, Some(2), Some(cursor));
+        assert_eq!(prev_page.edges.len(), 2);
+        assert_eq!(prev_page.edges[0].node.id.as_str(), "c");
+        assert_eq!(prev_page.edges[1].node.id.as_str(), "b");
+        assert!(prev_page.page_info.has_next_page);
+        assert!(prev_page.page_info.has_previous_page);
+    }
+
+    #[test]
+    fn backward_pagination_first_page_has_no_previous() {
+        let all = sample_events();
+        let last_page = paginate(&all, None, None, Some(2), None);
+        let cursor = last_page.edges.first().unwrap().cursor.clone();
+        let prev_page = paginate(&all, None, None, Some(2), Some(cursor));
+        let cursor = prev_page.edges.first().unwrap().cursor.clone();
+
+        let first_page = paginate(&all, None, None, Some(2), Some(cursor));
+        assert_eq!(first_page.edges.len(), 1);
+        assert_eq!(first_page.edges[0].node.id.as_str(), "a");
+        assert!(!first_page.page_info.has_previous_page);
+        assert!(first_page.page_info.has_next_page);
+    }
+
+    #[test]
+    fn empty_result_has_no_pages() {
+        let conn = paginate(&[], Some(10), None, None, None);
+        assert!(conn.edges.is_empty());
+        assert!(!conn.page_info.has_next_page);
+        assert!(!conn.page_info.has_previous_page);
+    }
 }

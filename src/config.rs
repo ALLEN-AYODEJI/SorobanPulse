@@ -561,6 +561,26 @@ pub struct Config {
     /// Deployment role: controls which subsystems start on this instance.
     /// Set via `ROLE=all|api|indexer`. Default: `all` (backward-compatible).
     pub role: Role,
+
+    // Issue #1262: derived metrics DSL
+    /// Path to a YAML file containing user-defined derived metric definitions.
+    /// Set via DERIVED_METRICS_CONFIG. When unset, no derived metrics run.
+    pub derived_metrics_config_path: Option<String>,
+    /// Inline derived metric definitions (YAML string), used when
+    /// DERIVED_METRICS_CONFIG is not set. Set via DERIVED_METRICS_INLINE.
+    pub derived_metrics_inline: Option<String>,
+    /// How often the derived metrics background job evaluates metrics (seconds).
+    /// Set via DERIVED_METRICS_INTERVAL_SECS. Default: 60.
+    pub derived_metrics_interval_secs: u64,
+
+    // Issue #1263: incident correlation engine
+    /// Sliding window (seconds) within which correlated signals are grouped
+    /// into a single incident. Set via CORRELATION_WINDOW_SECS.
+    /// Default: 300, clamped to [60, 3600].
+    pub correlation_window_secs: u64,
+    /// How often the incident detector evaluates correlation rules (seconds).
+    /// Set via INCIDENT_DETECTOR_INTERVAL_SECS. Default: 30, clamped to [10, 300].
+    pub incident_detector_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -740,6 +760,11 @@ impl Default for Config {
             ml_confidence_threshold: 0.8,
             ml_auto_retrain: true,
             role: Role::All,
+            derived_metrics_config_path: None,
+            derived_metrics_inline: None,
+            derived_metrics_interval_secs: 60,
+            correlation_window_secs: 300,
+            incident_detector_interval_secs: 30,
         }
     }
 }
@@ -1480,6 +1505,72 @@ impl Config {
         let rpc_headers = parse_rpc_headers_checked(&mut errors);
         let indexer_event_types = parse_indexer_event_types_checked(&mut errors);
 
+        // Issue #1262: derived metrics DSL configuration.
+        let derived_metrics_config_path = env_or_file("DERIVED_METRICS_CONFIG", &file)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let derived_metrics_inline = env_or_file("DERIVED_METRICS_INLINE", &file)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let derived_metrics_interval_secs = parse_int_range::<u64>(
+            "DERIVED_METRICS_INTERVAL_SECS",
+            &env_or_file_or("DERIVED_METRICS_INTERVAL_SECS", &file, "60"),
+            10,
+            3600,
+            "60",
+            &mut errors,
+        )
+        .unwrap_or(60);
+
+        // Issue #1263: incident correlation configuration. Out-of-range values
+        // are clamped (with a warning) rather than aborting startup, since a
+        // mis-sized window should not take the whole deployment down.
+        let correlation_window_secs = {
+            let raw = env_or_file_or("CORRELATION_WINDOW_SECS", &file, "300");
+            let parsed = raw.trim().parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %raw,
+                    "CORRELATION_WINDOW_SECS is not a valid integer; using default 300"
+                );
+                300
+            });
+            let clamped = parsed.clamp(60, 3600);
+            if clamped != parsed {
+                tracing::warn!(
+                    value = parsed,
+                    clamped = clamped,
+                    "CORRELATION_WINDOW_SECS out of range [60, 3600]; clamped"
+                );
+            }
+            clamped
+        };
+
+        let incident_detector_interval_secs = {
+            let raw = env_or_file_or("INCIDENT_DETECTOR_INTERVAL_SECS", &file, "30");
+            let parsed = raw.trim().parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %raw,
+                    "INCIDENT_DETECTOR_INTERVAL_SECS is not a valid integer; using default 30"
+                );
+                30
+            });
+            let clamped = parsed.clamp(10, 300);
+            if clamped != parsed {
+                tracing::warn!(
+                    value = parsed,
+                    clamped = clamped,
+                    "INCIDENT_DETECTOR_INTERVAL_SECS out of range [10, 300]; clamped"
+                );
+            }
+            clamped
+        };
+
+        tracing::info!(
+            correlation_window_secs = correlation_window_secs,
+            incident_detector_interval_secs = incident_detector_interval_secs,
+            "incident correlation configuration resolved"
+        );
+
         // Report all errors at once, then exit with code 1 so operators get a
         // clear, deterministic startup failure (a panic would exit with 101).
         if !errors.is_empty() {
@@ -1919,6 +2010,11 @@ impl Config {
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or(true),
             role: Role::from_str(&env_or_file_or("ROLE", &file, "all")),
+            derived_metrics_config_path,
+            derived_metrics_inline,
+            derived_metrics_interval_secs,
+            correlation_window_secs,
+            incident_detector_interval_secs,
         }
     }
 }
@@ -2369,5 +2465,70 @@ mod tests {
         let file = load_config_file();
         assert!(file.is_empty());
         env::remove_var("CONFIG_FILE");
+    }
+
+    // --- Issue #1262: derived metrics config ---
+
+    #[test]
+    fn derived_metrics_defaults() {
+        let config = Config::default();
+        assert!(config.derived_metrics_config_path.is_none());
+        assert!(config.derived_metrics_inline.is_none());
+        assert_eq!(config.derived_metrics_interval_secs, 60);
+    }
+
+    #[test]
+    fn derived_metrics_config_path_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "DERIVED_METRICS_CONFIG = \"/etc/pulse/metrics.yaml\"\n\
+             DERIVED_METRICS_INTERVAL_SECS = \"120\"\n",
+        )
+        .unwrap();
+        env::remove_var("DERIVED_METRICS_CONFIG");
+        env::remove_var("DERIVED_METRICS_INTERVAL_SECS");
+        env::set_var("CONFIG_FILE", path.to_str().unwrap());
+        let file = load_config_file();
+        let cfg_path = env_or_file("DERIVED_METRICS_CONFIG", &file);
+        let interval = env_or_file_or("DERIVED_METRICS_INTERVAL_SECS", &file, "60");
+        env::remove_var("CONFIG_FILE");
+        assert_eq!(cfg_path.as_deref(), Some("/etc/pulse/metrics.yaml"));
+        assert_eq!(interval, "120");
+    }
+
+    // --- Issue #1263: incident correlation config ---
+
+    #[test]
+    fn incident_correlation_defaults() {
+        let config = Config::default();
+        assert_eq!(config.correlation_window_secs, 300);
+        assert_eq!(config.incident_detector_interval_secs, 30);
+    }
+
+    #[test]
+    fn correlation_window_clamps_out_of_range() {
+        // Mirrors the clamping logic in from_env without touching global env.
+        let clamp = |raw: &str| -> u64 {
+            let parsed = raw.trim().parse::<u64>().unwrap_or(300);
+            parsed.clamp(60, 3600)
+        };
+        assert_eq!(clamp("300"), 300);
+        assert_eq!(clamp("10"), 60);
+        assert_eq!(clamp("99999"), 3600);
+        assert_eq!(clamp("not-a-number"), 300);
+    }
+
+    #[test]
+    fn incident_detector_interval_clamps_out_of_range() {
+        let clamp = |raw: &str| -> u64 {
+            let parsed = raw.trim().parse::<u64>().unwrap_or(30);
+            parsed.clamp(10, 300)
+        };
+        assert_eq!(clamp("30"), 30);
+        assert_eq!(clamp("1"), 10);
+        assert_eq!(clamp("1000"), 300);
+        assert_eq!(clamp("garbage"), 30);
     }
 }

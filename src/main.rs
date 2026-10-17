@@ -63,6 +63,8 @@ mod financial_accuracy;
 mod webhook_template;
 mod event_aggregation;
 mod anomaly_detection;
+mod derived_metrics;
+mod incident_correlation;
 mod push_notification;
 mod connection_pool;
 mod slo_tracker;
@@ -726,6 +728,38 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn resource metrics collector (all roles — useful on api pods too)
     resource_metrics::spawn_resource_collector(shutdown_rx.clone());
+
+    // Issue #1262: Spawn the derived metrics evaluation job. It evaluates each
+    // user-defined metric on its configured schedule, publishes the results to
+    // the Prometheus registry and persists snapshots for history.
+    {
+        let derived_metrics_config = derived_metrics::DerivedMetricsConfig::from_config(&config);
+        if derived_metrics_config.metrics.is_empty() {
+            info!("No derived metrics configured — derived metrics job not started");
+        } else {
+            info!(
+                count = derived_metrics_config.metrics.len(),
+                "Starting derived metrics evaluation job"
+            );
+            derived_metrics::spawn_evaluation_job(
+                pool.clone(),
+                derived_metrics_config,
+                shutdown_rx.clone(),
+            );
+        }
+    }
+
+    // Issue #1263: Spawn the incident correlation detector loop. It correlates
+    // anomaly alerts, RPC errors and indexer lag into incidents.
+    {
+        let incident_config = incident_correlation::IncidentCorrelationConfig::from_config(&config);
+        info!(
+            window_secs = incident_config.correlation_window_secs,
+            interval_secs = incident_config.evaluation_interval_secs,
+            "Starting incident correlation detector"
+        );
+        incident_correlation::spawn_detector(pool.clone(), incident_config, shutdown_rx.clone());
+    }
 
     // #496: Spawn audit log purge job
     {
