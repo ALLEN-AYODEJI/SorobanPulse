@@ -35,6 +35,74 @@ The `PodMemoryNearLimit` alert in `docs/alerts.yml` fires when `soroban_pulse_pr
 
 ---
 
+## Building the Docker Image
+
+The `Dockerfile` is a multi-stage build that uses [`cargo-chef`](https://github.com/LukeMathWalker/cargo-chef) to cache dependency compilation and ships a minimal `gcr.io/distroless/cc-debian12` runtime image.
+
+### Stages
+
+| Stage | Base image | Purpose |
+| ----- | ---------- | ------- |
+| `chef` | `rust:1-slim-bookworm` | Installs `cargo-chef` |
+| `planner` | `chef` | Produces the dependency recipe (`recipe.json`) |
+| `builder` | `chef` | Compiles dependencies from the recipe, then the application |
+| `runtime` | `gcr.io/distroless/cc-debian12` | Final image — binary + CA certs only |
+
+Because the dependency layer is keyed on `recipe.json`, changing application source only recompiles the crate itself, not its dependencies.
+
+### Building locally
+
+```bash
+# Standard build
+docker build -t soroban-pulse:latest .
+
+# Build for a specific platform (e.g. Apple Silicon -> amd64 servers)
+docker build --platform linux/amd64 -t soroban-pulse:latest .
+```
+
+The build is also wired into the Makefile:
+
+```bash
+make docker-build
+```
+
+### Expected image size
+
+The final image is **under 80 MB** (typically ~40–60 MB depending on the Rust toolchain version). Verify it with:
+
+```bash
+docker image inspect soroban-pulse:latest --format '{{.Size}}' | awk '{printf "%.1f MB\n", $1/1024/1024}'
+```
+
+### CI size gate
+
+The `docker` job in `.github/workflows/ci.yml` builds the image and **fails the build if the final image exceeds 80 MB**. The check runs after the build:
+
+```bash
+SIZE_BYTES=$(docker image inspect soroban-pulse:ci --format '{{.Size}}')
+MAX_BYTES=$((80 * 1024 * 1024))
+if [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
+  echo "Image is $((SIZE_BYTES / 1024 / 1024)) MB, exceeds 80 MB limit" >&2
+  exit 1
+fi
+```
+
+If this gate fails, check whether a new dependency pulled in large assets, or whether the build accidentally copied extra files into the runtime stage.
+
+### Runtime environment differences
+
+The distroless runtime image is intentionally minimal:
+
+- **No shell** — `docker exec ... sh` will not work. Use `kubectl debug` with an ephemeral container, or a sidecar, for interactive troubleshooting.
+- **No package manager** — install nothing at runtime; everything must be baked into the build stage.
+- **CA certificates** are included, so outbound TLS (Stellar RPC, S3 backups) works out of the box.
+- **Non-root user** — the container runs as `nonroot` (UID 65532). Ensure any mounted secret files are readable by that UID.
+- **Entrypoint** — the binary is the entrypoint (`/soroban-pulse`); pass arguments directly, e.g. `docker run soroban-pulse:latest --help`.
+- **Environment variables** — all env var defaults (`PORT=3000`, `ENVIRONMENT=development`, `BEHIND_PROXY=false`, etc.) are unchanged; nothing is baked into the image.
+- **Healthcheck** — the image declares a `HEALTHCHECK` that polls `GET /healthz/ready` on `$PORT` every 10 seconds (5s timeout, 5 retries, 30s start period). Because there is no shell, the check uses the binary's built-in `healthcheck` subcommand rather than `curl`/`wget`.
+
+---
+
 ## Healthcheck Configuration
 
 The `app` service in `docker-compose.yml` includes a Docker healthcheck that polls `GET /healthz/ready` every 10 seconds. The check is configured with:
