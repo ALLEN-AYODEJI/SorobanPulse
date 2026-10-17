@@ -306,20 +306,6 @@ impl TelegramClient {
     }
 }
 
-/// Deliver an event to Telegram with retry logic
-pub async fn deliver_telegram(
-    client: &TelegramClient,
-    event: Event,
-) {
-    if let Err(e) = client.send_with_retry(&event, 3).await {
-        error!(
-            error = %e,
-            contract_id = %event.contract_id,
-            event_type = %event.event_type,
-            "Failed to deliver Telegram notification"
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -244,20 +244,6 @@ impl GitHubClient {
     }
 }
 
-/// Deliver an event to GitHub with retry logic
-pub async fn deliver_github(
-    client: &GitHubClient,
-    event: SorobanEvent,
-) {
-    if let Err(e) = client.send_with_retry(&event, 3).await {
-        error!(
-            error = %e,
-            contract_id = %event.contract_id,
-            event_type = %event.event_type,
-            "Failed to deliver GitHub notification"
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {

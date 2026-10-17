@@ -7,7 +7,7 @@
 //! - Severity mapping
 //! - Escalation policy serialization/deserialization
 //! - Auto-resolve configuration
-//! - `deliver_pagerduty` skips filtered events
+//! - `should_trigger` skips filtered events
 //! - On-call scheduler creation (unit test — no network)
 //! - `PagerDutyConfig` default values
 

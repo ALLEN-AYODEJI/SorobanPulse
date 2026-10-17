@@ -629,28 +629,6 @@ impl PagerDutyClient {
 // Convenience top-level function
 // ---------------------------------------------------------------------------
 
-/// Trigger a PagerDuty incident for `event` when it passes the client's
-/// configured filters.  Errors are logged and swallowed so callers don't need
-/// to handle them.
-pub async fn deliver_pagerduty(
-    client: &PagerDutyClient,
-    event: SorobanEvent,
-    integration_id: Option<Uuid>,
-    pool: Option<&sqlx::PgPool>,
-) {
-    if !client.should_trigger(&event) {
-        return;
-    }
-
-    if let Err(e) = client.trigger_incident(&event, integration_id, pool).await {
-        error!(
-            error        = %e,
-            contract_id  = %event.contract_id,
-            event_type   = %event.event_type,
-            "Failed to deliver PagerDuty notification"
-        );
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Tests

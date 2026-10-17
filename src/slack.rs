@@ -306,20 +306,6 @@ impl SlackClient {
     }
 }
 
-/// Deliver an event to Slack with retry logic
-pub async fn deliver_slack(
-    client: &SlackClient,
-    event: Event,
-) {
-    if let Err(e) = client.send_with_retry(&event, 3).await {
-        error!(
-            error = %e,
-            contract_id = %event.contract_id,
-            event_type = %event.event_type,
-            "Failed to deliver Slack notification"
-        );
-    }
-}
 
 #[cfg(test)]
 mod tests {

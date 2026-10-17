@@ -420,14 +420,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Spawn SMS notification task if Twilio is configured (Issue #473)
+    // Issue #1245: environment-configured notification channels are
+    // registered with a single dispatcher that consumes the event stream.
+    // New channels only need a `NotificationChannel` impl and a `register`.
+    let mut notification_dispatcher = notification_channel::NotificationDispatcher::new();
+
+    // SMS notifications if Twilio is configured (Issue #473)
     if let (Some(account_sid), Some(auth_token), Some(from_number)) = (
         &config.twilio_account_sid,
         &config.twilio_auth_token,
         &config.twilio_from_number,
     ) {
         if !config.sms_to_numbers.is_empty() {
-            let sms_rx = event_tx.subscribe();
             let twilio_config = sms::TwilioConfig {
                 account_sid: account_sid.clone(),
                 auth_token: auth_token.clone(),
@@ -435,23 +439,30 @@ async fn main() -> anyhow::Result<()> {
                 to_numbers: config.sms_to_numbers.clone(),
             };
 
-            let notifier = sms::SmsNotifier::new(
+            match sms::SmsNotifier::new(
                 twilio_config,
                 config.sms_contract_filter.clone(),
                 config.sms_retry_policy.clone(),
                 pool.clone(),
-            );
-
-            info!(
-                from_number = %from_number,
-                recipients = config.sms_to_numbers.len(),
-                "SMS notifications enabled"
-            );
-
-            notifier.spawn(sms_rx);
+            ) {
+                Ok(notifier) => {
+                    info!(
+                        from_number = %from_number,
+                        recipients = config.sms_to_numbers.len(),
+                        "SMS notifications enabled"
+                    );
+                    notification_dispatcher.register(std::sync::Arc::new(notifier));
+                }
+                Err(e) => error!(error = %e, "SMS notifications disabled"),
+            }
         } else {
             warn!("Twilio credentials set but SMS_TO_NUMBERS is empty — SMS notifications disabled");
         }
+    }
+
+    if !notification_dispatcher.is_empty() {
+        info!(channels = ?notification_dispatcher.channel_names(), "Notification dispatcher started");
+        notification_dispatcher.spawn(event_tx.subscribe());
     }
 
     // Issue #619: Spawn subscription email delivery worker.
