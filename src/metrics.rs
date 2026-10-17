@@ -440,6 +440,31 @@ pub fn update_pool_utilization(pool: &PgPool, max_connections: u32) {
     m::gauge!("soroban_pulse_db_pool_utilization").set(utilization);
     m::gauge!("soroban_pulse_db_pool_active_connections").set(active);
     m::gauge!("soroban_pulse_db_pool_max_connections").set(max);
+    // Names documented in README.md ("Database pool metrics").
+    m::gauge!("soroban_pulse_db_pool_size").set(size);
+    m::gauge!("soroban_pulse_db_pool_idle").set(idle);
+    m::gauge!("soroban_pulse_db_pool_max").set(max);
+}
+
+/// Issue #1244: adaptive tuner recommendations (see `db_pool::adaptive`).
+pub fn update_pool_adaptive_targets(recommended_min: u32, recommended_max: u32) {
+    m::gauge!("soroban_pulse_db_pool_adaptive_target_min").set(f64::from(recommended_min));
+    m::gauge!("soroban_pulse_db_pool_adaptive_target_max").set(f64::from(recommended_max));
+}
+
+/// Issue #1244: a failed adaptive-tuner keepalive ping.
+pub fn record_pool_health_check_failure() {
+    m::counter!("soroban_pulse_db_pool_health_check_failures_total").increment(1);
+}
+
+/// Issue #1244: idle connections flagged as potentially stale by the tuner.
+pub fn record_pool_stale_connections(count: u64) {
+    m::counter!("soroban_pulse_db_pool_stale_connections_total").increment(count);
+}
+
+/// Issue #1244: a tracked acquisition that hit its timeout.
+pub fn record_pool_acquire_timeout() {
+    m::counter!("soroban_pulse_db_pool_acquire_timeout_total").increment(1);
 }
 
 /// Issue #622: Record connection acquisition latency.

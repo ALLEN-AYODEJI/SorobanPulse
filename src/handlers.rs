@@ -4862,7 +4862,7 @@ pub async fn resume_indexer(
 pub async fn get_pool_statistics(
     State(state): State<AppState>,
 ) -> Result<Json<crate::models::PoolStatistics>, (StatusCode, Json<Value>)> {
-    crate::pool_management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db.max_connections)
+    crate::db_pool::management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db_max_connections)
         .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))
@@ -4881,12 +4881,12 @@ pub async fn get_pool_statistics(
 pub async fn get_pool_tuning_guide(
     State(state): State<AppState>,
 ) -> Result<Json<crate::models::PoolTuningGuide>, (StatusCode, Json<Value>)> {
-    let pool_stats = crate::pool_management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db.max_connections)
+    let pool_stats = crate::db_pool::management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db_max_connections)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
 
     let current_config = crate::models::PoolConfig {
-        max_connections: state.config.db.max_connections,
+        max_connections: state.config.db_max_connections,
         min_connections: state.config.db.min_connections.unwrap_or(1),
         connection_timeout_secs: 30,
         idle_timeout_secs: 600,
@@ -4894,7 +4894,7 @@ pub async fn get_pool_tuning_guide(
         sample_interval_secs: 15,
     };
 
-    let guide = crate::pool_management::generate_tuning_guide(&pool_stats, &current_config);
+    let guide = crate::db_pool::management::generate_tuning_guide(&pool_stats, &current_config);
     Ok(Json(guide))
 }
 
@@ -4911,10 +4911,10 @@ pub async fn get_pool_tuning_guide(
 pub async fn get_pool_health(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    crate::pool_management::check_pool_health(
+    crate::db_pool::management::check_pool_health(
         &state.db,
         state.pool_stats.clone(),
-        state.config.db.max_connections,
+        state.config.db_max_connections,
         0.9,
     )
     .await
@@ -15403,7 +15403,7 @@ pub async fn record_slo_sample(
 pub async fn get_adaptive_pool_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let status = crate::adaptive_pool::AdaptivePoolStatus::from_state(&state.adaptive_pool);
+    let status = crate::db_pool::adaptive::AdaptivePoolStatus::from_state(&state.adaptive_pool);
     Ok(Json(serde_json::to_value(&status).unwrap_or_else(|_| json!({"error": "serialization failed"}))))
 }
 
@@ -15415,7 +15415,7 @@ pub async fn get_adaptive_pool_status(
 /// Body: JSON matching `AdaptivePoolConfig`.
 pub async fn update_adaptive_pool_config(
     State(state): State<AppState>,
-    Json(new_config): Json<crate::adaptive_pool::AdaptivePoolConfig>,
+    Json(new_config): Json<crate::db_pool::adaptive::AdaptivePoolConfig>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     state.adaptive_pool.apply_config(new_config).map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))

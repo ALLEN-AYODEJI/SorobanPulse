@@ -133,9 +133,9 @@ pub struct AppState {
     /// Issue #618: Anonymization rules configuration.
     pub anonymization_config: Option<Arc<crate::anonymization::AnonymizationConfig>>,
     /// Issue #817: Connection pool stats tracker (shared with pool monitor).
-    pub pool_stats: Arc<crate::connection_pool::PoolStats>,
+    pub pool_stats: Arc<crate::db_pool::PoolStats>,
     /// Issue #817: Adaptive pool tuner — hot-reloadable config, snapshots, counters.
-    pub adaptive_pool: Arc<crate::adaptive_pool::AdaptiveTunerState>,
+    pub adaptive_pool: Arc<crate::db_pool::AdaptiveTunerState>,
     /// Issue #817: Alias so handlers can use `state.db` (same as `state.pool`).
     pub db: sqlx::PgPool,
     /// Issue #879: Circuit breaker manager for webhook endpoints.
@@ -456,22 +456,12 @@ pub fn create_router_with_tx_and_tenant_map(
         config.query_cache_max_capacity,
     );
 
-    // Issue #817: spawn pool monitor and adaptive tuner.
-    let pool_stats = {
-        let pool_cfg = crate::connection_pool::PoolMonitorConfig {
-            max_connections: config.db_max_connections,
-            min_connections: config.db_min_connections,
-            exhaustion_threshold: 0.9,
-            sample_interval: std::time::Duration::from_secs(15),
-        };
-        crate::connection_pool::spawn_pool_monitor(pool.clone(), pool_cfg)
-    };
-    let adaptive_pool = crate::adaptive_pool::spawn_adaptive_monitor(
-        pool.clone(),
-        crate::adaptive_pool::AdaptivePoolConfig::default(),
-        config.db_max_connections,
-        config.db_min_connections,
-    );
+    // Issue #817 / #1244: monitors are started once by `db_pool::DbPool::init`;
+    // the router only shares their handles.
+    let crate::db_pool::PoolMonitors {
+        stats: pool_stats,
+        adaptive: adaptive_pool,
+    } = crate::db_pool::monitors();
 
     let circuit_breaker_manager = crate::webhook_circuit_breaker::CircuitBreakerManager::new(
         crate::webhook_circuit_breaker::CircuitBreakerConfig::default()
@@ -1531,12 +1521,10 @@ pub fn create_minimal_router(
 
     let sse_connections_per_ip = std::sync::Arc::new(dashmap::DashMap::new());
 
-    let pool_stats = std::sync::Arc::new(crate::connection_pool::PoolStats::new(
-        config.db_max_connections,
-    ));
-    let adaptive_pool = std::sync::Arc::new(crate::adaptive_pool::AdaptiveTunerState::new(
-        crate::adaptive_pool::AdaptivePoolConfig::default(),
-    ));
+    let crate::db_pool::PoolMonitors {
+        stats: pool_stats,
+        adaptive: adaptive_pool,
+    } = crate::db_pool::monitors();
 
     let app_state = AppState {
         pool: pool.clone(),

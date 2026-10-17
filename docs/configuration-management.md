@@ -98,7 +98,7 @@ Most configuration takes effect only on restart. The exceptions are:
 
 | Setting | Mechanism |
 |---------|-----------|
-| `AdaptivePoolConfig` fields | `watch::Sender<AdaptivePoolConfig>` in `src/adaptive_pool.rs` — send a new config to the channel |
+| `AdaptivePoolConfig` fields | `watch::Sender<AdaptivePoolConfig>` in `src/db_pool/adaptive.rs` — send a new config to the channel |
 | Feature flags | `GET/PUT /v1/admin/feature-flags` API — takes effect immediately |
 | Indexer pause/resume | `POST /v1/admin/indexer/pause` and `/resume` |
 

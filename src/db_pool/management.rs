@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::connection_pool::PoolStats;
+use super::monitor::PoolStats;
 use crate::error::ApiError;
 use crate::models::{
     PoolConfig, PoolConfigRequest, PoolConfigResponse, PoolStatistics, PoolTuningGuide,

@@ -33,7 +33,6 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use rand::prelude::*;
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -259,9 +258,12 @@ async fn main() -> Result<()> {
     let t0 = Instant::now();
 
     // Build a small pool — the seed binary doesn't need many connections.
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url)
+    let settings = soroban_pulse::db_pool::DbPoolSettings {
+        max_connections: 5,
+        min_connections: 1,
+        ..soroban_pulse::db_pool::DbPoolSettings::default()
+    };
+    let pool = soroban_pulse::db_pool::connect(&database_url, &settings)
         .await
         .context("Failed to connect to the database")?;
 
