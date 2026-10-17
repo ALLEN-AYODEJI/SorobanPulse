@@ -561,6 +561,14 @@ pub struct Config {
     /// Deployment role: controls which subsystems start on this instance.
     /// Set via `ROLE=all|api|indexer`. Default: `all` (backward-compatible).
     pub role: Role,
+
+    // Issue #1267: GraphQL query limits
+    /// Maximum nesting depth allowed in a GraphQL query (default 10).
+    /// Set via GRAPHQL_MAX_DEPTH.
+    pub graphql_max_depth: usize,
+    /// Maximum query complexity allowed in a GraphQL query (default 1000).
+    /// Set via GRAPHQL_MAX_COMPLEXITY.
+    pub graphql_max_complexity: usize,
 }
 
 impl Default for Config {
@@ -740,6 +748,8 @@ impl Default for Config {
             ml_confidence_threshold: 0.8,
             ml_auto_retrain: true,
             role: Role::All,
+            graphql_max_depth: 10,
+            graphql_max_complexity: 1000,
         }
     }
 }
@@ -1919,6 +1929,25 @@ impl Config {
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or(true),
             role: Role::from_str(&env_or_file_or("ROLE", &file, "all")),
+            // Issue #1267: GraphQL query limits
+            graphql_max_depth: parse_int_range::<usize>(
+                "GRAPHQL_MAX_DEPTH",
+                &env_or_file_or("GRAPHQL_MAX_DEPTH", &file, "10"),
+                1,
+                100,
+                "10",
+                &mut errors,
+            )
+            .unwrap_or(10),
+            graphql_max_complexity: parse_int_range::<usize>(
+                "GRAPHQL_MAX_COMPLEXITY",
+                &env_or_file_or("GRAPHQL_MAX_COMPLEXITY", &file, "1000"),
+                1,
+                1_000_000,
+                "1000",
+                &mut errors,
+            )
+            .unwrap_or(1000),
         }
     }
 }
@@ -2012,6 +2041,62 @@ mod tests {
         assert_eq!(config.start_ledger, 0);
         assert!(!config.start_ledger_fallback);
         assert_eq!(config.environment, Environment::Development);
+        assert_eq!(config.graphql_max_depth, 10);
+        assert_eq!(config.graphql_max_complexity, 1000);
+    }
+
+    #[test]
+    fn graphql_limits_parse_from_env() {
+        env::set_var("GRAPHQL_MAX_DEPTH", "5");
+        env::set_var("GRAPHQL_MAX_COMPLEXITY", "250");
+        let mut errors = Vec::new();
+        let depth = parse_int_range::<usize>(
+            "GRAPHQL_MAX_DEPTH",
+            &env_or_file_or("GRAPHQL_MAX_DEPTH", &load_config_file(), "10"),
+            1,
+            100,
+            "10",
+            &mut errors,
+        );
+        let complexity = parse_int_range::<usize>(
+            "GRAPHQL_MAX_COMPLEXITY",
+            &env_or_file_or("GRAPHQL_MAX_COMPLEXITY", &load_config_file(), "1000"),
+            1,
+            1_000_000,
+            "1000",
+            &mut errors,
+        );
+        env::remove_var("GRAPHQL_MAX_DEPTH");
+        env::remove_var("GRAPHQL_MAX_COMPLEXITY");
+        assert_eq!(depth, Some(5));
+        assert_eq!(complexity, Some(250));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn graphql_limits_reject_invalid_values() {
+        let mut errors = Vec::new();
+        let depth = parse_int_range::<usize>(
+            "GRAPHQL_MAX_DEPTH",
+            "0",
+            1,
+            100,
+            "10",
+            &mut errors,
+        );
+        let complexity = parse_int_range::<usize>(
+            "GRAPHQL_MAX_COMPLEXITY",
+            "not-a-number",
+            1,
+            1_000_000,
+            "1000",
+            &mut errors,
+        );
+        assert!(depth.is_none());
+        assert!(complexity.is_none());
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("GRAPHQL_MAX_DEPTH"));
+        assert!(errors[1].contains("GRAPHQL_MAX_COMPLEXITY"));
     }
 
     #[test]

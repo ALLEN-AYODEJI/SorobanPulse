@@ -27,6 +27,7 @@ pub mod config;
 pub mod dashboard;
 pub mod config_validation;
 pub mod content_filter;
+pub mod costs;
 pub mod data_integrity;
 pub mod data_quality;
 pub mod db;

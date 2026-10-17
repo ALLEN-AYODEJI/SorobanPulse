@@ -4802,15 +4802,14 @@ pub async fn delete_contract_events(
 )]
 pub async fn pause_indexer(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, AppError> {
     if !state
         .indexer_state
         .is_active_indexer
         .load(Ordering::Relaxed)
     {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "pause endpoint only available on active indexer" })),
+        return Err(AppError::Forbidden(
+            "pause endpoint only available on active indexer".to_string(),
         ));
     }
     state.indexer_state.is_paused.store(true, Ordering::Relaxed);
@@ -4831,15 +4830,14 @@ pub async fn pause_indexer(
 )]
 pub async fn resume_indexer(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, AppError> {
     if !state
         .indexer_state
         .is_active_indexer
         .load(Ordering::Relaxed)
     {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "resume endpoint only available on active indexer" })),
+        return Err(AppError::Forbidden(
+            "resume endpoint only available on active indexer".to_string(),
         ));
     }
     state
@@ -4848,6 +4846,80 @@ pub async fn resume_indexer(
         .store(false, Ordering::Relaxed);
     tracing::info!("Indexer resumed via admin API");
     Ok(Json(json!({ "indexer_paused": false })))
+}
+
+/// Operational cost report with per-component breakdown and a linear forecast
+/// (Issue #1264).
+///
+/// `GET /v1/admin/costs/report`
+///
+/// Aggregates the hourly `cost_snapshots` rows over the requested window
+/// (default: last 24 hours) and returns the cost breakdown by component
+/// (`rpc`, `db`, `notification`) together with a forecast for the next window
+/// produced by the linear model in `costs::forecast`.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/costs/report",
+    tag = "admin",
+    params(
+        ("hours" = Option<i64>, Query, description = "Lookback window in hours (default 24)"),
+        ("forecast_hours" = Option<i64>, Query, description = "Forecast horizon in hours (default 24)"),
+    ),
+    responses(
+        (status = 200, description = "Cost breakdown by component with forecast", body = Value),
+        (status = 400, description = "Invalid query parameters", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Failed to generate cost report", body = ErrorResponse),
+    )
+)]
+pub async fn get_cost_report(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let hours = match params.get("hours") {
+        Some(raw) => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|h| *h > 0 && *h <= 24 * 90)
+            .ok_or_else(|| {
+                AppError::Validation("hours must be an integer between 1 and 2160".to_string())
+            })?,
+        None => 24,
+    };
+    let forecast_hours = match params.get("forecast_hours") {
+        Some(raw) => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|h| *h > 0 && *h <= 24 * 90)
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "forecast_hours must be an integer between 1 and 2160".to_string(),
+                )
+            })?,
+        None => 24,
+    };
+
+    let report = crate::costs::report::generate_report(&state.read_pool, hours)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to generate cost report: {e}")))?;
+
+    let forecast = crate::costs::report::generate_forecast(&state.read_pool, forecast_hours)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to generate cost forecast: {e}")))?;
+
+    Ok(Json(json!({
+        "window_hours": hours,
+        "total_cost": report.total_cost,
+        "breakdown": report.by_component,
+        "snapshots": report.snapshot_count,
+        "forecast": {
+            "horizon_hours": forecast_hours,
+            "predicted_cost": forecast.predicted_cost,
+            "slope": forecast.slope,
+            "intercept": forecast.intercept,
+            "confidence": forecast.confidence,
+        },
+    })))
 }
 
 /// Get current database connection pool statistics

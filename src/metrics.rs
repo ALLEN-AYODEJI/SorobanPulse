@@ -1658,6 +1658,38 @@ pub fn update_active_alerts_count(component: &str, count: u64) {
     .set(count as f64);
 }
 
+// ── Issue #1264: Operational cost tracking metrics ──────────────────────────
+//
+// These back the Grafana cost panel and satisfy Requirement 4.5 of the
+// operational-cost-tracking spec. `soroban_pulse_cost_total` is a counter of
+// accumulated cost (in USD) per component/resource type, updated by
+// `src/costs/calculator.rs`; `soroban_pulse_cost_forecast_monthly` is the
+// projected monthly spend produced by `src/costs/forecast.rs`.
+
+/// Record accumulated operational cost for a component/resource type.
+pub fn record_cost(component: &str, resource_type: &str, cost_usd: f64) {
+    if !cost_usd.is_finite() || cost_usd <= 0.0 {
+        return;
+    }
+    m::counter!(
+        "soroban_pulse_cost_total",
+        "component" => component.to_string(),
+        "resource_type" => resource_type.to_string()
+    )
+    .increment(cost_usd);
+}
+
+/// Set the projected monthly cost for a component/resource type.
+pub fn update_cost_forecast_monthly(component: &str, resource_type: &str, cost_usd: f64) {
+    let safe = if cost_usd.is_finite() { cost_usd.max(0.0) } else { 0.0 };
+    m::gauge!(
+        "soroban_pulse_cost_forecast_monthly",
+        "component" => component.to_string(),
+        "resource_type" => resource_type.to_string()
+    )
+    .set(safe);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
