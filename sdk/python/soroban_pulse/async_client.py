@@ -10,6 +10,7 @@ import httpx
 
 from .exceptions import ApiError, AuthenticationError
 from .client import DEFAULT_BASE_URL, DEFAULT_TIMEOUT
+from .models import MetaResponse
 
 
 class AsyncSorobanPulseClient:
@@ -80,6 +81,10 @@ class AsyncSorobanPulseClient:
                 raise AuthenticationError(payload.get("message", "authentication failed"))
             raise ApiError(resp.status_code, payload.get("message", "request failed"), payload=payload)
         return payload
+
+    async def get_meta(self) -> MetaResponse:
+        """Build metadata and enabled features (``GET /v1/meta``, no auth needed)."""
+        return MetaResponse.from_dict(await self._request("GET", "/meta"))
 
     async def list_events(
         self,

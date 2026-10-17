@@ -2,6 +2,8 @@ pub mod net;
 pub mod email_token;
 pub mod resources;
 pub mod rpc_meta;
+pub mod rpc_endpoints;
+pub mod contract_resource_stats;
 pub mod backfill;
 pub mod abi;
 pub mod advisory_lock;
@@ -148,5 +150,7 @@ pub mod graphql_subscriptions;
 pub mod query_plan_cache;
 pub mod partition_manager;
 pub mod notification_admin;
+pub mod meta;
+pub mod api_keys;
 #[cfg(feature = "archive")]
 pub mod archiver;

@@ -29,7 +29,7 @@ pub async fn refresh_all(pool: &PgPool) {
     refresh_table_stats(pool).await;
 }
 
-async fn refresh_one(pool: &PgPool, view: &str) {
+pub(crate) async fn refresh_one(pool: &PgPool, view: &str) {
     let start = Instant::now();
 
     // Acquire a dedicated connection so the lock_timeout SET is scoped to this

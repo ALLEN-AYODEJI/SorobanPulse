@@ -48,6 +48,8 @@ fn build_app(
         admin_api_keys,
         tenant_map: Arc::new(tenant_map),
         multi_tenant,
+        pool: None,
+        require_auth: false,
     });
 
     Router::new()
