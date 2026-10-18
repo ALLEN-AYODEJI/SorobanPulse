@@ -170,6 +170,14 @@ pub struct Event {
     /// suffix (Issue #1065).
     #[sqlx(default)]
     pub event_index: Option<i32>,
+    /// Underlying asset code when the event was emitted by a Stellar Asset
+    /// Contract (`"native"` for XLM); `null` otherwise (Issue #1254).
+    #[sqlx(default)]
+    pub asset_code: Option<String>,
+    /// Issuer (`G...`) of the SAC's underlying asset; `null` for native XLM
+    /// and non-SAC events (Issue #1254).
+    #[sqlx(default)]
+    pub asset_issuer: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     pub total_count: i64,
@@ -627,6 +635,18 @@ pub struct ContractSummary {
     pub first_seen_ledger: i64,
     pub last_seen_ledger: i64,
     pub last_event_at: DateTime<Utc>,
+    /// Deployer address from the contract's creation event (Issue #1255);
+    /// `null` until a deployment event has been indexed.
+    #[sqlx(default)]
+    pub deployer: Option<String>,
+    /// Current WASM hash (hex) from deployment/upgrade events (Issue #1255).
+    #[sqlx(default)]
+    pub wasm_hash: Option<String>,
+    #[sqlx(default)]
+    pub deployed_at: Option<DateTime<Utc>>,
+    /// Name from the contract labels registry, if registered (Issue #1255).
+    #[sqlx(default)]
+    pub label: Option<String>,
 }
 
 /// Detailed per-contract summary returned by GET /v1/contracts/:contract_id/summary.
@@ -716,6 +736,9 @@ impl PaginationParams {
         "created_at",
         "schema_version",
         "anonymized",
+        // Issue #1254: SAC underlying asset (null for non-SAC events).
+        "asset_code",
+        "asset_issuer",
     ];
     pub const MAX_CONTRACT_IDS_FILTER: usize = 20;
 

@@ -111,6 +111,26 @@ pub fn record_events_indexed(count: u64) {
     m::counter!("soroban_pulse_events_indexed_total").increment(count);
 }
 
+/// Issue #1252: highest ledger a Galexie backfill run has fully processed.
+pub fn update_backfill_progress_ledger(ledger: u64) {
+    m::gauge!("soroban_pulse_backfill_progress_ledger").set(ledger as f64);
+}
+
+/// Issue #1252: ledgers processed by backfill.
+pub fn record_backfill_ledgers(count: u64) {
+    m::counter!("soroban_pulse_backfill_ledgers_total").increment(count);
+}
+
+/// Issue #1252: events newly inserted by backfill (duplicates excluded).
+pub fn record_backfill_events(count: u64) {
+    m::counter!("soroban_pulse_backfill_events_total").increment(count);
+}
+
+/// Issue #1255: a contract entered the deployment registry.
+pub fn record_contract_tracked() {
+    m::counter!("soroban_pulse_contracts_tracked_total").increment(1);
+}
+
 /// Update the current ledger being processed
 pub fn update_current_ledger(ledger: u64) {
     m::gauge!("soroban_pulse_indexer_current_ledger").set(ledger as f64);

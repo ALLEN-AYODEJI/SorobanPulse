@@ -334,6 +334,8 @@ pub struct Indexer<R: RpcClient> {
     kafka_topic: Option<String>,
     #[cfg(feature = "lua")]
     lua_transformer: Option<Arc<crate::lua_transform::LuaTransformer>>,
+    /// Issue #1254: sha256(network passphrase), used to recognise SAC events.
+    sac_network_id: [u8; 32],
 }
 
 impl<R: RpcClient> Indexer<R> {
@@ -343,6 +345,7 @@ impl<R: RpcClient> Indexer<R> {
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
         rpc_client: R,
     ) -> Self {
+        let sac_network_id = crate::sac::network_id(&crate::sac::network_passphrase(&config.chain_id));
         Self {
             pool,
             rpc_client,
@@ -365,6 +368,7 @@ impl<R: RpcClient> Indexer<R> {
             kafka_topic: None,
             #[cfg(feature = "lua")]
             lua_transformer: None,
+            sac_network_id,
         }
     }
 
@@ -1277,9 +1281,18 @@ impl<R: RpcClient> Indexer<R> {
         let op_index = ordinal.map(|o| o.op_index);
         let event_index = ordinal.map(|o| o.event_index);
 
+        // Issue #1254: enrich Stellar Asset Contract events with the
+        // underlying classic asset; NULL for every non-SAC event.
+        let topics = event.topic.as_deref().unwrap_or_default();
+        let sac_asset = crate::sac::detect(&event.contract_id, topics, &self.sac_network_id);
+        let (asset_code, asset_issuer) = match &sac_asset {
+            Some(a) => (Some(a.code.as_str()), a.issuer.as_deref()),
+            None => (None, None),
+        };
+
         let result = sqlx::query(
-            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint, event_data_compressed, compression_algo, chain_id, tx_index, op_index, event_index)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            r#"INSERT INTO events (contract_id, event_type, tx_hash, ledger, timestamp, event_data, ledger_hash, in_successful_call, event_data_decoded, tenant_id, fingerprint, event_data_compressed, compression_algo, chain_id, tx_index, op_index, event_index, asset_code, asset_issuer)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
                ON CONFLICT (tx_hash, contract_id, event_type) DO NOTHING"#,
         )
         .bind(&event.contract_id)
@@ -1299,12 +1312,32 @@ impl<R: RpcClient> Indexer<R> {
         .bind(tx_index)
         .bind(op_index)
         .bind(event_index)
+        .bind(asset_code)
+        .bind(asset_issuer)
         .execute(&mut **tx)
         .await?;
 
         let rows = result.rows_affected();
         if rows > 0 {
             metrics::record_fingerprint_stored();
+            // Issue #1253: first sighting of a contract queues a spec fetch
+            // (no-op unless AUTO_FETCH_CONTRACT_SPECS is enabled).
+            crate::contract_specs::request_fetch(&event.contract_id);
+            // Issue #1255: record deployments/upgrades in the same
+            // transaction. A savepoint keeps a tracking failure from
+            // aborting the surrounding event inserts.
+            if let Some(deployment) =
+                crate::contract_tracker::parse(&event.contract_id, &event.event_type, topics, &event.value)
+            {
+                let mut savepoint = sqlx::Connection::begin(&mut **tx).await?;
+                match crate::contract_tracker::record(&mut savepoint, &deployment, ledger, timestamp, &event.tx_hash).await {
+                    Ok(_) => savepoint.commit().await?,
+                    Err(e) => {
+                        tracing::warn!(error = %e, contract_id = %deployment.contract_id, "failed to record contract deployment");
+                        savepoint.rollback().await?;
+                    }
+                }
+            }
             // Record in bloom filter after successful insert
             if let Some(ref bloom) = self.bloom_filter {
                 bloom.set(&event.tx_hash, &event.contract_id, &event.event_type);
@@ -1331,6 +1364,26 @@ impl<R: RpcClient> Indexer<R> {
             }
         }
         Ok(rows)
+    }
+}
+
+/// Issue #1252: backfill stores through the live insert path.
+#[async_trait::async_trait]
+impl<R: RpcClient> crate::backfill::EventSink for Indexer<R> {
+    async fn store_events(&self, events: &[SorobanEvent], schema_version: i32) -> Result<u64, String> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
+        let mut inserted = 0;
+        for event in events {
+            inserted += self
+                .store_event_in_tx(&mut tx, event, schema_version)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(inserted)
     }
 }
 

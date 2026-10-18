@@ -3795,7 +3795,7 @@ pub async fn get_recent_events(
     };
 
     let query_str = format!(
-        "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, schema_version, 0::bigint AS total_count \
+        "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, schema_version, asset_code, asset_issuer, 0::bigint AS total_count \
          FROM events {} ORDER BY ledger DESC, id DESC LIMIT ${}",
         where_clause, bind_idx,
     );
@@ -5384,7 +5384,7 @@ pub async fn get_events_diff(
         ("sort" = Option<String>, Query, description = "Sort order: event_count_desc, event_count_asc, last_seen_desc (default), first_seen_asc"),
     ),
     responses(
-        (status = 200, description = "Paginated list of indexed contract IDs with event counts and ledger info"),
+        (status = 200, description = "Paginated list of indexed contract IDs with event counts, ledger info, deployer, WASM hash and label"),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 429, description = "Too many requests", body = ErrorResponse),
         (status = 500, description = "Internal server error", body = ErrorResponse),
@@ -5403,13 +5403,19 @@ pub async fn get_contracts(
         _ => "ORDER BY last_seen_ledger DESC",
     };
 
+    // Issue #1255: join the deployment registry and the labels registry.
     let rows = sqlx::query_as::<_, ContractSummary>(
         &format!(
-            "SELECT contract_id, COUNT(*) AS event_count, MIN(ledger) AS first_seen_ledger, \
-             MAX(ledger) AS last_seen_ledger, MAX(timestamp) AS last_event_at \
-             FROM events GROUP BY contract_id {} \
-             LIMIT $1 OFFSET $2",
-            sort_clause
+            "SELECT s.*, c.deployer, c.wasm_hash, c.deployed_at, m.name AS label FROM ( \
+                 SELECT contract_id, COUNT(*) AS event_count, MIN(ledger) AS first_seen_ledger, \
+                 MAX(ledger) AS last_seen_ledger, MAX(timestamp) AS last_event_at \
+                 FROM events GROUP BY contract_id {} \
+                 LIMIT $1 OFFSET $2 \
+             ) s \
+             LEFT JOIN contracts c ON c.contract_id = s.contract_id \
+             LEFT JOIN contract_metadata m ON m.contract_id = s.contract_id \
+             {}",
+            sort_clause, sort_clause
         ),
     )
     .bind(limit)

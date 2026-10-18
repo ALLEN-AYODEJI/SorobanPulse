@@ -13,7 +13,7 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use stellar_xdr::curr::{Limits, ScVal, WriteXdr};
+use stellar_xdr::curr::{Limits, ReadXdr, ScVal, WriteXdr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -126,6 +126,17 @@ pub fn parse_format(raw: Option<&str>) -> Result<ScValFormat, String> {
     match raw {
         None => Ok(ScValFormat::Json),
         Some(s) => s.parse(),
+    }
+}
+
+/// Decode a stored topic/value entry into an `ScVal`. Events indexed from
+/// RPC `getEvents` keep the base64 XDR strings the RPC returns; other paths
+/// store stellar-xdr's serde JSON. Returns `None` for anything else.
+pub fn parse_stored(value: &Value) -> Option<ScVal> {
+    match value {
+        Value::String(s) => ScVal::from_xdr_base64(s, Limits::none()).ok(),
+        Value::Null => None,
+        other => serde_json::from_value(other.clone()).ok(),
     }
 }
 

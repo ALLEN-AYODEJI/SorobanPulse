@@ -225,6 +225,8 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
         handlers::get_contract_abi,
         handlers::upsert_contract_metadata,
         handlers::get_contract_metadata,
+        crate::contract_tracker::get_contract,
+        crate::contract_specs::get_contract_spec,
         handlers::anonymize_event,
         handlers::pause_indexer,
         handlers::resume_indexer,
@@ -263,6 +265,7 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
         crate::models::SortOrder,
         crate::models::PaginationParams,
         crate::models::ContractSummary,
+        crate::contract_tracker::TrackedContract,
         crate::models::ContractDetailSummary,
         crate::models::LedgerRange,
         crate::models::EventTypeBreakdown,
@@ -724,6 +727,10 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/tokens/{contract_id}/transfers", axum::routing::get(crate::token_events::get_token_transfers))
         .route("/accounts/{address}/events", axum::routing::get(crate::account_events::get_account_events))
         .route("/contracts/{contract_id}/versions", axum::routing::get(crate::contract_versions::get_contract_versions))
+        // Issue #1255: deployment record (deployer, WASM hash, label)
+        .route("/contracts/{contract_id}", axum::routing::get(crate::contract_tracker::get_contract))
+        // Issue #1253: contract spec auto-fetched from on-chain WASM
+        .route("/contracts/{contract_id}/spec", axum::routing::get(crate::contract_specs::get_contract_spec))
         // Issue #607: Cached ABI endpoint
         .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached))
         // Issue #632: Feature flag client-side endpoint
