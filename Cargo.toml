@@ -81,6 +81,7 @@ tokio-tungstenite = "0.21"
 bytes = "1.5"
 base64 = "0.21"
 hex = "0.4"
+stellar-xdr = { version = "22", features = ["curr", "serde", "base64"] }
 regex = "1"
 blake3 = "1"
 toml = "0.8"

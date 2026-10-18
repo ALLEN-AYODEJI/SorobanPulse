@@ -459,7 +459,8 @@ pub(crate) fn validate_ledger_param(name: &str, value: i64) -> Result<(), AppErr
     Ok(())
 }
 
-pub(crate) fn validate_contract_id(contract_id: &str) -> Result<(), AppError> {
+/// Public so the `fuzz_validate_contract_id` target can link against it (issue #1229).
+pub fn validate_contract_id(contract_id: &str) -> Result<(), AppError> {
     if contract_id.len() != 56 {
         return Err(AppError::Validation(
             "invalid contract_id format".to_string(),
@@ -478,7 +479,8 @@ pub(crate) fn validate_contract_id(contract_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn validate_tx_hash(tx_hash: &str) -> Result<(), AppError> {
+/// Public so the `fuzz_validate_tx_hash` target can link against it (issue #1227).
+pub fn validate_tx_hash(tx_hash: &str) -> Result<(), AppError> {
     if tx_hash.len() != 64 {
         return Err(AppError::Validation("invalid tx_hash format".to_string()));
     }
@@ -7587,6 +7589,38 @@ mod tests {
     #[test]
     fn validate_tx_hash_valid_uppercase_returns_ok() {
         assert!(validate_tx_hash(&"A".repeat(64)).is_ok());
+    }
+
+    // --- Fuzz regressions (issues #1227, #1229): multi-byte UTF-8 inputs ---
+
+    #[test]
+    fn validate_contract_id_multibyte_with_56_byte_len_returns_err() {
+        // 'é' is 2 bytes, so this is 56 bytes but only 55 chars.
+        let s = format!("C{}é", "A".repeat(53));
+        assert_eq!(s.len(), 56);
+        assert!(validate_contract_id(&s).is_err());
+    }
+
+    #[test]
+    fn validate_contract_id_multibyte_leading_char_returns_err() {
+        let s = format!("Ç{}", "A".repeat(54));
+        assert_eq!(s.len(), 56);
+        assert!(validate_contract_id(&s).is_err());
+    }
+
+    #[test]
+    fn validate_tx_hash_multibyte_with_64_byte_len_returns_err() {
+        let s = format!("{}é", "a".repeat(62));
+        assert_eq!(s.len(), 64);
+        assert!(validate_tx_hash(&s).is_err());
+    }
+
+    #[test]
+    fn validate_tx_hash_non_ascii_digits_returns_err() {
+        // Fullwidth digits are numeric but not ASCII hex.
+        let s = format!("{}０", "a".repeat(61));
+        assert_eq!(s.len(), 64);
+        assert!(validate_tx_hash(&s).is_err());
     }
 
     #[sqlx::test(migrations = "./migrations")]

@@ -322,6 +322,49 @@ perf(db): add GIN index on event_data JSONB column
 Improves topic filtering query performance by 10x.
 ```
 
+## Issue Lifecycle
+
+Every contribution follows the same path from issue to merge:
+
+1. **Find** an open, unassigned issue — start with
+   [`good first issue`](https://github.com/Soroban-Pulse/SorobanPulse/issues?q=is%3Aissue+is%3Aopen+no%3Aassignee+label%3A%22good+first+issue%22)
+   or [`help wanted`](https://github.com/Soroban-Pulse/SorobanPulse/issues?q=is%3Aissue+is%3Aopen+no%3Aassignee+label%3A%22help+wanted%22).
+2. **Claim** it by commenting (see [Claiming an Issue](#claiming-an-issue)) and wait to be assigned.
+3. **Build** the change on a branch from the latest `main` (see [Contribution Workflow](#contribution-workflow)).
+4. **Open a PR** that follows the [Pull Request rules](#pull-requests).
+5. **Review**: address feedback with new commits; a maintainer or area owner from
+   [MAINTAINERS.md](MAINTAINERS.md) approves.
+6. **Merge**: a maintainer squash-merges once required checks are green; the linked issue closes automatically.
+
+### Claiming an Issue
+
+- Comment on the issue asking to be assigned (e.g. "I'd like to work on this").
+  Do not start work until a maintainer assigns you — unassigned work may collide with someone else's.
+- An issue that already has an assignee is taken. Do not open a competing PR; ask in the issue if you think the claim is abandoned.
+- **New contributors** (no merged PR yet) may hold **at most 2 assigned issues** at a time. Open a PR for one before claiming another.
+- **7-day inactivity release**: if an assigned issue has no activity (comment, linked PR or push) for 7 days,
+  the [Stale Claims](.github/workflows/stale-claims.yml) workflow unassigns it and adds `help wanted`.
+  Post a short progress update to keep a claim alive; issues labelled `pinned` or `priority: critical` are exempt.
+- If you can no longer work on an issue, comment so it can be reassigned.
+
+### Issue Labels
+
+Labels are defined in [`.github/labels.yml`](.github/labels.yml) and synced to the repository by the
+[Sync Labels](.github/workflows/labels.yml) workflow. Add or change labels in that file, not in the GitHub UI.
+
+| Label | Meaning |
+|---|---|
+| `bug`, `enhancement`, `documentation` | Type of change |
+| `good first issue` | Small, well-scoped task with clear acceptance criteria; ideal for a first PR |
+| `help wanted` | Maintainers welcome outside contributions; also applied when a stale claim is released |
+| `difficulty: easy` / `medium` / `hard` | Expected effort and required domain knowledge |
+| `priority: critical` | Production-impacting; reviewed first and exempt from the stale-claim release |
+| `area: indexer`, `area: api`, `area: database`, `area: integrations`, `area: sdk`, `area: frontend`, `area: infra`, `area: docs` | The part of the codebase the issue touches; routes review to the owners in [MAINTAINERS.md](MAINTAINERS.md) |
+| `stale`, `pinned` | Stale-claim workflow state; `pinned` opts an issue out |
+| `security`, `fuzzing`, `automated` | Applied by automation (e.g. the nightly fuzz workflow) |
+
+Every triaged issue should have one type label, one `area:` label and one `difficulty:` label.
+
 ## Contribution Workflow
 
 The preferred contribution path is: open or find an issue, confirm the intended scope, create a branch from the latest `main`, make the smallest complete change, add regression coverage or documentation, run the local checks, and open a pull request. If the change affects API behavior, database schema, deployment, security, or architecture, explain the impact in the issue and link the relevant design or runbook documentation.
@@ -381,10 +424,17 @@ Before requesting review, verify that the change is scoped to the issue, tests c
 
 ## Pull Requests
 
-- Keep PRs focused — one logical change per PR.
-- Ensure `make test` and `make lint` pass locally before opening a PR.
-- Write a clear PR description referencing the relevant issue (e.g. `Closes #75`).
+- **One issue per PR.** Only bundle issues that are tightly related (e.g. the same bug reported twice,
+  or changes that cannot land separately) and explain why in the description. Unrelated bundles will be asked to split.
+- **Link every issue** with `Closes #N` in the PR description — one line per issue — so it closes on merge.
+  Only open a PR for issues you are assigned to.
+- **Required checks** must be green before merge: `Format`, `Clippy`, `cargo-deny`, `Check Migrations`,
+  `sqlx prepare --check` and `Test (rust stable, …)` from [CI](.github/workflows/ci.yml),
+  plus any area-specific workflow your change triggers (e.g. `Dashboard Build`, `Validate SDKs`).
+  Run `make test` and `make lint` locally first.
+- Fill in every section of the [PR template](.github/pull_request_template.md).
 - Use Conventional Commits for all commit messages in the PR.
+- Respond to review feedback within 7 days; PRs left without a response may be closed and the issue released.
 
 ## Releases
 

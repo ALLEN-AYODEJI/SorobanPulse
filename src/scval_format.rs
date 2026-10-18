@@ -15,6 +15,38 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use stellar_xdr::curr::{Limits, ScVal, WriteXdr};
 
+/// Maximum JSON nesting depth accepted before an ScVal is decoded.
+///
+/// Decoding, native rendering and XDR encoding all recurse once per level,
+/// so deeply nested `vec`/`map` input could overflow the stack (issue #1226).
+pub const MAX_SCVAL_JSON_DEPTH: usize = 64;
+
+/// Returns `true` when `value` nests deeper than [`MAX_SCVAL_JSON_DEPTH`].
+/// Iterative, so it is safe to call on arbitrarily deep input.
+pub fn exceeds_max_depth(value: &Value) -> bool {
+    let mut stack = vec![(value, 1usize)];
+    while let Some((v, depth)) = stack.pop() {
+        if depth > MAX_SCVAL_JSON_DEPTH {
+            return true;
+        }
+        match v {
+            Value::Array(items) => stack.extend(items.iter().map(|i| (i, depth + 1))),
+            Value::Object(map) => stack.extend(map.values().map(|i| (i, depth + 1))),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Decode a stellar-xdr serde JSON value as an `ScVal`, refusing input that
+/// nests deeper than [`MAX_SCVAL_JSON_DEPTH`].
+pub fn decode_scval(value: &Value) -> Option<ScVal> {
+    if exceeds_max_depth(value) {
+        return None;
+    }
+    serde_json::from_value::<ScVal>(value.clone()).ok()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ScValFormat {
@@ -48,16 +80,16 @@ impl std::str::FromStr for ScValFormat {
 pub fn render(value: &Value, format: ScValFormat) -> Value {
     match format {
         ScValFormat::Json => value.clone(),
-        ScValFormat::Native => match serde_json::from_value::<ScVal>(value.clone()) {
-            Ok(scval) => to_native(&scval),
-            Err(_) => value.clone(),
+        ScValFormat::Native => match decode_scval(value) {
+            Some(scval) => to_native(&scval),
+            None => value.clone(),
         },
-        ScValFormat::Xdr => match serde_json::from_value::<ScVal>(value.clone()) {
-            Ok(scval) => match scval.to_xdr_base64(Limits::none()) {
+        ScValFormat::Xdr => match decode_scval(value) {
+            Some(scval) => match scval.to_xdr_base64(Limits::none()) {
                 Ok(b64) => json!(b64),
                 Err(_) => value.clone(),
             },
-            Err(_) => value.clone(),
+            None => value.clone(),
         },
     }
 }
@@ -154,6 +186,34 @@ mod tests {
     #[test]
     fn parse_format_defaults_to_json() {
         assert_eq!(parse_format(None).unwrap(), ScValFormat::Json);
+    }
+
+    fn nested_vec(depth: usize) -> Value {
+        let mut v = json!({"u32": 1});
+        for _ in 0..depth {
+            v = json!({"vec": [v]});
+        }
+        v
+    }
+
+    /// Regression for issue #1226: deeply nested input must not reach the
+    /// recursive decoder/renderer.
+    #[test]
+    fn deeply_nested_scval_falls_back_without_panicking() {
+        let v = nested_vec(MAX_SCVAL_JSON_DEPTH);
+        assert!(exceeds_max_depth(&v));
+        assert!(decode_scval(&v).is_none());
+        for format in [ScValFormat::Json, ScValFormat::Native, ScValFormat::Xdr] {
+            assert_eq!(render(&v, format), v);
+        }
+    }
+
+    #[test]
+    fn shallow_nested_scval_still_renders() {
+        let v = nested_vec(4);
+        assert!(!exceeds_max_depth(&v));
+        assert!(decode_scval(&v).is_some());
+        assert_eq!(render(&v, ScValFormat::Native), json!([[[[1]]]]));
     }
 
     proptest! {
