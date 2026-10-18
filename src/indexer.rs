@@ -2012,7 +2012,7 @@ mod tests {
         let mut indexer = Indexer {
             pool: pool.clone(),
             rpc_client: Arc::new(FailingRpcClient),
-            config: Config::from_env(),
+            config: Config::default(),
             shutdown_rx,
             indexer_state: None,
             health_state: None,

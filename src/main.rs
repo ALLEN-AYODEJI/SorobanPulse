@@ -2,7 +2,7 @@
 // Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, config_validation, content_filter, cross_chain_correlation, cursor_expiry_handler, db, db_pool, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
+use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, content_filter, cross_chain_correlation, cursor_expiry_handler, db, db_pool, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
 #[cfg(feature = "lua")]
 use soroban_pulse::lua_transform;
 #[cfg(feature = "parquet")]
@@ -71,20 +71,12 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     metrics::spawn_memory_collector();
 
-    let config = config::Config::from_env();
-
-    // Issue #997: Validate the fully-loaded configuration before doing anything else.
-    {
-        let report = config_validation::validate(&config);
-        report.log();
-        if !report.is_ok() {
-            eprintln!(
-                "Configuration validation failed with {} error(s) — aborting startup.",
-                report.errors.len()
-            );
-            std::process::exit(1);
-        }
-    }
+    // Issue #1247: parse + validate the configuration exactly once. Every
+    // parse and semantic error is reported together in `ConfigError`.
+    let config = config::ConfigBuilder::from_env().build().inspect_err(|e| {
+        error!("{e}");
+        eprintln!("Startup aborted due to configuration errors. Fix the above and restart.");
+    })?;
 
     info!(
         rpc_url = %config.stellar_rpc_url,

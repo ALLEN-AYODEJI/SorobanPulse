@@ -437,7 +437,7 @@ mod tests {
         };
         let mut call_count = 0;
 
-        let result = policy.execute_with_retry(|_attempt| {
+        let result: Result<(), &str> = policy.execute_with_retry(|_attempt| {
             call_count += 1;
             async move { Err("persistent error") }
         }).await;
