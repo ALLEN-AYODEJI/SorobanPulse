@@ -146,6 +146,12 @@ for the exact grant statement needed.
 - **Understand testing conventions**: [CONTRIBUTING.md](../CONTRIBUTING.md) —
   commit message format, migration naming, fuzzing, mutation testing, and the
   PR checklist.
+- **Keep fuzzed functions `pub`**: the `fuzz/` crate links `soroban_pulse` as
+  an external dependency, so any function a fuzz target calls (for example
+  `handlers::validate_contract_id` / `handlers::validate_tx_hash`) must be
+  `pub`, not `pub(crate)` — otherwise the nightly fuzz job fails to build and
+  is reported as a crash. Regression inputs for fuzz targets live in
+  `tests/fixtures/fuzz_seeds/<target>/` (`fuzz/corpus/` is git-ignored).
 - **Understand performance work**: [Performance Tuning Guide](performance-tuning.md)
   and [Database Configuration Tuning](database-configuration-tuning.md).
 - **Pick a first issue**: look for issues labeled `good first issue` (if none

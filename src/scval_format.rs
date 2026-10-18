@@ -156,6 +156,35 @@ mod tests {
         assert_eq!(parse_format(None).unwrap(), ScValFormat::Json);
     }
 
+    /// Fuzz regression (#1236): non-ScVal JSON, extreme 128-bit parts and
+    /// nested containers must render in every format without panicking.
+    #[test]
+    fn render_edge_cases_never_panic() {
+        let cases = [
+            json!(null),
+            json!(42),
+            json!("not an scval"),
+            json!({"unknown_tag": 1}),
+            serde_json::to_value(ScVal::I128(stellar_xdr::curr::Int128Parts { hi: i64::MIN, lo: u64::MAX })).unwrap(),
+            serde_json::to_value(ScVal::U128(stellar_xdr::curr::UInt128Parts { hi: u64::MAX, lo: u64::MAX })).unwrap(),
+            serde_json::to_value(ScVal::Vec(None)).unwrap(),
+            serde_json::to_value(ScVal::Map(None)).unwrap(),
+        ];
+        for v in &cases {
+            for format in [ScValFormat::Json, ScValFormat::Native, ScValFormat::Xdr] {
+                let _ = render(v, format);
+            }
+        }
+    }
+
+    #[test]
+    fn native_renders_extreme_i128_and_u128() {
+        let min = ScVal::I128(stellar_xdr::curr::Int128Parts { hi: i64::MIN, lo: 0 });
+        let max = ScVal::U128(stellar_xdr::curr::UInt128Parts { hi: u64::MAX, lo: u64::MAX });
+        assert_eq!(render(&serde_json::to_value(min).unwrap(), ScValFormat::Native), json!(i128::MIN.to_string()));
+        assert_eq!(render(&serde_json::to_value(max).unwrap(), ScValFormat::Native), json!(u128::MAX.to_string()));
+    }
+
     proptest! {
         /// Issue #1064 acceptance criterion: xdr -> json -> xdr round-trips
         /// losslessly for simple scalar ScVals.
