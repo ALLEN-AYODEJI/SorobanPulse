@@ -351,6 +351,11 @@ pub async fn deliver_with_retry_policy(
                 {
                     error!(error = %e, "Failed to insert webhook failure into DLQ");
                 }
+
+                // Move the exhausted delivery into the webhook DLQ (Issue #1260).
+                if let Err(e) = enqueue_dlq(pool, None, &event, &error_msg).await {
+                    error!(error = %e, url = %url, "Failed to insert webhook into DLQ");
+                }
             }
 
             metrics::record_webhook_failure();
@@ -574,9 +579,135 @@ pub async fn deliver_with_failover(
         {
             error!(error = %e, "Failed to insert webhook failure into DLQ");
         }
+
+        // Move the exhausted delivery into the webhook DLQ (Issue #1260).
+        if let Err(e) = enqueue_dlq(pool, None, &event, "Primary and failover both failed").await {
+            error!(error = %e, "Failed to insert webhook into DLQ");
+        }
     }
     metrics::record_webhook_failure();
     false
+}
+
+/// Insert an exhausted webhook delivery into the `webhook_dlq` table and
+/// refresh the DLQ depth gauge (Issue #1260).
+pub async fn enqueue_dlq(
+    pool: &sqlx::PgPool,
+    subscription_id: Option<Uuid>,
+    event: &SorobanEvent,
+    last_error: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let payload = serde_json::to_value(event).unwrap_or(serde_json::json!({}));
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO webhook_dlq \
+         (subscription_id, event_id, payload, last_error, failed_at) \
+         VALUES ($1, $2, $3, $4, NOW()) \
+         RETURNING id",
+    )
+    .bind(subscription_id)
+    .bind(&event.tx_hash)
+    .bind(payload)
+    .bind(last_error)
+    .fetch_one(pool)
+    .await?;
+
+    refresh_dlq_depth(pool).await;
+    Ok(id)
+}
+
+/// Recompute the `soroban_pulse_webhook_dlq_depth` gauge from the table.
+pub async fn refresh_dlq_depth(pool: &sqlx::PgPool) {
+    match sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM webhook_dlq WHERE replayed_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    {
+        Ok(depth) => metrics::set_webhook_dlq_depth(depth),
+        Err(e) => warn!(error = %e, "Failed to compute webhook DLQ depth"),
+    }
+}
+
+/// Re-enqueue a single DLQ row into the normal delivery queue and mark it
+/// replayed (Issue #1260). Returns `Ok(false)` if the row does not exist or
+/// has already been replayed.
+pub async fn replay_dlq_entry(pool: &sqlx::PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT payload, last_error FROM webhook_dlq \
+         WHERE id = $1 AND replayed_at IS NULL",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(false);
+    };
+
+    let payload: Value = row.try_get("payload")?;
+    let last_error: Option<String> = row.try_get("last_error").ok();
+    let event: SorobanEvent = match serde_json::from_value(payload) {
+        Ok(event) => event,
+        Err(e) => {
+            warn!(error = %e, dlq_id = %id, "Failed to deserialize DLQ payload");
+            return Ok(false);
+        }
+    };
+
+    // Re-enter the normal delivery queue.
+    enqueue_endpoint_retry(
+        pool,
+        &event.contract_id,
+        &event,
+        &None,
+        last_error.as_deref().unwrap_or("replayed from DLQ"),
+        chrono::Utc::now(),
+    )
+    .await;
+
+    sqlx::query("UPDATE webhook_dlq SET replayed_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+
+    refresh_dlq_depth(pool).await;
+    Ok(true)
+}
+
+/// Bulk replay of DLQ entries, optionally filtered by `subscription_id`
+/// (Issue #1260). Returns the number of entries replayed.
+pub async fn replay_dlq_bulk(
+    pool: &sqlx::PgPool,
+    subscription_id: Option<Uuid>,
+) -> Result<u64, sqlx::Error> {
+    let ids: Vec<Uuid> = match subscription_id {
+        Some(sub_id) => {
+            sqlx::query_scalar(
+                "SELECT id FROM webhook_dlq \
+                 WHERE replayed_at IS NULL AND subscription_id = $1",
+            )
+            .bind(sub_id)
+            .fetch_all(pool)
+            .await?
+        }
+        None => {
+            sqlx::query_scalar("SELECT id FROM webhook_dlq WHERE replayed_at IS NULL")
+                .fetch_all(pool)
+                .await?
+        }
+    };
+
+    let mut replayed = 0u64;
+    for id in ids {
+        match replay_dlq_entry(pool, id).await {
+            Ok(true) => replayed += 1,
+            Ok(false) => {}
+            Err(e) => warn!(error = %e, dlq_id = %id, "Failed to replay DLQ entry"),
+        }
+    }
+
+    refresh_dlq_depth(pool).await;
+    Ok(replayed)
 }
 
 #[cfg(test)]

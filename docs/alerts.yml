@@ -304,3 +304,26 @@ groups:
           summary: "Error rate approaching feature flag rollback threshold"
           description: "Current error rate is {{ $value | humanizePercentage }} (rollback threshold 5%). Feature flags with auto_rollback enabled may be disabled soon."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/feature-flag-rollback.md"
+
+      # #1263: Incident correlation alerts
+      - alert: IncidentsOpen
+        expr: soroban_pulse_incidents_open > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: incident_correlation
+        annotations:
+          summary: "Soroban Pulse has open correlated incidents"
+          description: "{{ $value }} incident(s) remain open for more than 5 minutes. Correlated anomaly alerts, RPC errors, and indexer lag have been grouped into incidents. Review them via GET /v1/admin/incidents and investigate the underlying signals."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/incident-correlation.md"
+
+      - alert: IncidentCreationSpike
+        expr: increase(soroban_pulse_incidents_created_total[10m]) >= 3
+        for: 0m
+        labels:
+          severity: critical
+          component: incident_correlation
+        annotations:
+          summary: "Multiple correlated incidents created in a short window"
+          description: "{{ $value }} incident(s) were created in the last 10 minutes, indicating a burst of correlated anomaly events (RPC errors, indexer lag, or anomaly alerts). Check GET /v1/admin/incidents and the indexer/RPC health dashboards."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/incident-correlation.md"

@@ -6,6 +6,8 @@ use std::collections::VecDeque;
 use uuid::Uuid;
 use tracing::{info, error, warn};
 
+use crate::incident_correlation::{self, CorrelationSignal, SignalKind};
+
 /// Anomaly detection method
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum DetectionMethod {
@@ -307,6 +309,33 @@ pub async fn record_anomaly_alert(
         severity = severity,
         "Anomaly detected and alerted"
     );
+
+    // Feed the anomaly into the incident correlation engine. Failure to
+    // correlate must not fail alert recording, so errors are only logged.
+    let signal = CorrelationSignal {
+        subscription_id,
+        kind: SignalKind::Anomaly,
+        source: metric_name.clone(),
+        severity: severity.to_string(),
+        observed_at: Utc::now(),
+        details: serde_json::json!({
+            "alert_id": alert_id,
+            "event_id": event_id,
+            "metric_name": metric_name,
+            "metric_value": metric_value,
+            "anomaly_score": anomaly_score,
+            "detection_method": method_str,
+        }),
+    };
+
+    if let Err(e) = incident_correlation::ingest_signal(pool, signal).await {
+        error!(
+            alert_id = %alert_id,
+            subscription_id = %subscription_id,
+            error = %e,
+            "Failed to correlate anomaly signal into incidents"
+        );
+    }
 
     Ok(AnomalyAlertResponse {
         alert_id,

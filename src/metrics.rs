@@ -1658,6 +1658,86 @@ pub fn update_active_alerts_count(component: &str, count: u64) {
     .set(count as f64);
 }
 
+// ── Issue #1260: Webhook dead-letter queue metrics ──────────────────────────
+
+/// Update the current depth of the webhook dead-letter queue.
+///
+/// Published on every DLQ insert, delete, and replay so operators can alert on
+/// a growing backlog of webhooks that exhausted all delivery retries.
+pub fn update_webhook_dlq_depth(count: u64) {
+    m::gauge!("soroban_pulse_webhook_dlq_depth").set(count as f64);
+}
+
+// ── Issue #1262: Derived metrics framework ──────────────────────────────────
+
+/// Publish the current value of a user-defined derived metric.
+///
+/// The metric name is `soroban_pulse_derived_<name>` and carries a
+/// `derived=true` label so derived series can be selected independently of
+/// built-in metrics in Prometheus queries.
+pub fn update_derived_metric(name: &str, value: f64) {
+    let safe = if value.is_finite() { value } else { 0.0 };
+    m::gauge!(
+        "soroban_pulse_derived_metric",
+        "name" => name.to_string(),
+        "derived" => "true"
+    )
+    .set(safe);
+}
+
+/// Record how long a single derived metric evaluation took.
+pub fn record_derived_metric_evaluation_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_derived_metrics_evaluation_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a failed derived metric evaluation (query error, evaluator panic, ...).
+pub fn record_derived_metric_evaluation_error() {
+    m::counter!("soroban_pulse_derived_metrics_evaluation_errors_total").increment(1);
+}
+
+/// Record a derived metric definition that failed to parse.
+pub fn record_derived_metric_parse_error() {
+    m::counter!("soroban_pulse_derived_metrics_parse_errors_total").increment(1);
+}
+
+// ── Issue #1263: Incident correlation metrics ───────────────────────────────
+
+/// Record an incident created by the correlation engine.
+pub fn record_incident_created(kind: &str, severity: &str) {
+    m::counter!(
+        "soroban_pulse_incidents_created_total",
+        "kind" => kind.to_string(),
+        "severity" => severity.to_string()
+    )
+    .increment(1);
+}
+
+/// Record an incident resolved (manually or automatically).
+pub fn record_incident_resolved(kind: &str) {
+    m::counter!(
+        "soroban_pulse_incidents_resolved_total",
+        "kind" => kind.to_string()
+    )
+    .increment(1);
+}
+
+/// Update the number of currently open incidents.
+pub fn update_open_incidents(count: u64) {
+    m::gauge!("soroban_pulse_incidents_open").set(count as f64);
+}
+
+/// Record how long a correlation pass took.
+pub fn record_correlation_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_correlation_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a detector error encountered while gathering correlation inputs.
+pub fn record_detector_error() {
+    m::counter!("soroban_pulse_detector_errors_total").increment(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
