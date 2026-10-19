@@ -244,6 +244,55 @@ lefthook install
 
 Hooks typically complete in under 30 seconds on a typical change. If a hook fails, fix the reported issue and re-commit.
 
+## Dependency License Policy
+
+This project is licensed under the [MIT License](LICENSE). All dependencies must
+be compatible with that license.
+
+- **GPL and AGPL licensed dependencies are not permitted.** `cargo-deny` is
+  configured in `deny.toml` to deny these licenses, along with any license not
+  on the allow-list.
+- **Known vulnerabilities and unmaintained crates are denied.** The `advisories`
+  section of `deny.toml` denies `vulnerability` and `unmaintained` advisories
+  from the RustSec database.
+- **CI enforces this.** The `cargo-deny` CI job runs `cargo-deny check` on every
+  push and pull request. A new dependency that introduces a license violation or
+  a known advisory will fail CI and cannot be merged.
+
+Run the check locally before pushing:
+
+```bash
+cargo install cargo-deny   # once
+cargo deny check
+```
+
+### Adding a justified exception
+
+If a dependency genuinely cannot be avoided, add a narrowly scoped exception to
+`deny.toml` rather than disabling the check:
+
+- **License exceptions** go under `licenses.exceptions` with the crate name and
+  the license being allowed, and must include a `reason` explaining why the
+  dependency is required and why the license is acceptable.
+- **Advisory exceptions** go under `advisories.ignore` with the advisory ID and
+  must include a `reason` and a target removal date, so the exception is
+  revisited rather than forgotten.
+
+```toml
+[licenses]
+exceptions = [
+    { name = "example-crate", allow = ["GPL-3.0"], reason = "Build-time only; not distributed" },
+]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-0000-0000", reason = "Not reachable from our code paths", until = "2026-01-01" },
+]
+```
+
+Exceptions are reviewed like any other code change; expect reviewers to ask
+whether the dependency can be replaced or removed instead.
+
 ## Security: Never Log Sensitive Values
 
 Never log passwords, API keys, tokens, or other credentials at any log level. This includes:

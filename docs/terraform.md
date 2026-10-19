@@ -228,20 +228,63 @@ Then add the CNAME validation record to your DNS and wait for status to become `
 
 ## CI/CD Integration
 
-Add the following to your GitHub Actions workflow to run `terraform plan` on every PR:
+Terraform changes are automated through two GitHub Actions workflows. No manual `terraform apply` is needed for the normal flow.
 
-```yaml
-- name: Terraform Plan
-  env:
-    AWS_ACCESS_KEY_ID: ${{ secrets.TF_AWS_ACCESS_KEY_ID }}
-    AWS_SECRET_ACCESS_KEY: ${{ secrets.TF_AWS_SECRET_ACCESS_KEY }}
-    TF_VAR_certificate_arn: ${{ secrets.ACM_CERT_ARN }}
-    TF_VAR_environment: staging
-  run: |
-    cd terraform
-    terraform init
-    terraform plan -out=tfplan
+> **TL;DR** — PRs touching `terraform/` show the plan as a comment; merging to `main` applies to **staging** automatically.
+
+### `terraform-ci.yml` — Plan on Pull Request
+
+Triggered on any PR that modifies files under `terraform/`. It:
+
+1. Runs `terraform fmt -check -recursive` (fails the job on unformatted files).
+2. Runs `terraform init` against the S3 backend and `terraform validate`.
+3. Runs `terraform plan` for the target workspace.
+4. Posts the plan output as a **PR comment** (updated in place on each push) using [`hashicorp/setup-terraform`](https://github.com/hashicorp/setup-terraform).
+
+The plan is generated with `-lock=false` and never applied, so PRs are read-only against infrastructure.
+
+### `terraform-apply.yml` — Apply on Merge to `main`
+
+Triggered on push to `main` when `terraform/` changes. It runs `terraform apply` for the **staging** environment only. Production is never applied automatically — it must be run manually (see below).
+
+### Required Repository Secrets
+
+| Secret | Purpose |
+|--------|---------|
+| `TF_AWS_ACCESS_KEY_ID` | IAM credentials for Terraform |
+| `TF_AWS_SECRET_ACCESS_KEY` | IAM credentials for Terraform |
+| `ACM_CERT_ARN` | Value for `TF_VAR_certificate_arn` |
+
+### Selecting an Environment with `TF_WORKSPACE`
+
+Both workflows accept a `TF_WORKSPACE` input (workflow_dispatch) that selects the Terraform workspace, which maps 1:1 to an environment:
+
+| `TF_WORKSPACE` | Environment | Applied by CI |
+|----------------|-------------|---------------|
+| `dev` | Development | Manual only |
+| `staging` | Staging | Automatically on merge to `main` |
+| `production` | Production | Manual only (requires approval) |
+
+`TF_WORKSPACE` is exported to the Terraform CLI, so `terraform init`/`plan`/`apply` operate on the matching workspace and state prefix. To run a workflow for a specific environment, use **Actions → (workflow) → Run workflow** and set `TF_WORKSPACE`.
+
+To apply production manually:
+
+```bash
+cd terraform
+terraform init
+terraform workspace select production
+terraform apply -var-file="environments/production/terraform.tfvars"
 ```
+
+### Remote State Backend (S3 + DynamoDB)
+
+State lives in S3 with DynamoDB locking (configured in `providers.tf`). The bucket and lock table are created once by the bootstrap script:
+
+```bash
+./scripts/terraform-init.sh
+```
+
+This creates the versioned, encrypted `soroban-pulse-terraform-state` bucket and the `soroban-pulse-terraform-locks` DynamoDB table (see [Bootstrapping Remote State](#bootstrapping-remote-state) for the equivalent manual commands). CI authenticates to the same backend, so local and CI runs share state and locking.
 
 ## Common Commands
 
