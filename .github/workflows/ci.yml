@@ -678,6 +678,21 @@ jobs:
       - name: Validate OpenAPI spec
         run: spectral lint openapi.json --ruleset https://unpkg.com/@stoplight/spectral-openapi/dist/ruleset.js
 
+  config-docs:
+    name: Configuration Reference Up To Date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - run: sudo apt-get install -y pkg-config libssl-dev
+      # Fails when docs/configuration.md or .env.example are stale, or when
+      # src/config.rs reads a variable missing from src/config/reference.rs.
+      - name: Check generated configuration docs
+        run: cargo run --bin gen_config_docs -- --check
+
   terraform-validate:
     name: Terraform Validate
     runs-on: ubuntu-latest

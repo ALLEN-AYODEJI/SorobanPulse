@@ -136,3 +136,9 @@ tests/parallel_output/
 
 # jsonschema generated artefacts
 *.jsonschema.out
+
+# Docs site (Docusaurus) build output
+docs/site/node_modules/
+docs/site/build/
+docs/site/.docusaurus/
+docs/site/static/openapi.json

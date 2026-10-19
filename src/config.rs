@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use secrecy::SecretString;
 
+pub mod reference;
+
 /// Load an optional TOML config file. Returns an empty table if the file is
 /// absent or CONFIG_FILE is not set — never an error.
 fn load_config_file() -> toml::Table {
