@@ -4,16 +4,168 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use url::Url;
 use uuid::Uuid;
 
 use crate::{config::Environment, error::AppError, idempotency, routes::AppState};
+
+// ---------------------------------------------------------------------------
+// Per-IP rate limiting (Issue #1268)
+// ---------------------------------------------------------------------------
+
+/// Default number of subscription creations allowed per IP per minute.
+pub const DEFAULT_SUBSCRIPTION_RATE_LIMIT_PER_MINUTE: u32 = 5;
+/// Default maximum number of concurrent SSE connections per IP.
+pub const DEFAULT_SSE_MAX_CONNECTIONS_PER_IP: usize = 5;
+/// Window over which subscription creations are counted.
+const SUBSCRIPTION_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Fixed-window counter for a single IP.
+#[derive(Debug)]
+struct WindowCounter {
+    window_start: Instant,
+    count: u32,
+}
+
+/// DashMap-backed per-IP rate limiter for `POST /v1/subscriptions`.
+#[derive(Debug, Clone)]
+pub struct SubscriptionRateLimiter {
+    inner: Arc<DashMap<IpAddr, WindowCounter>>,
+    limit: u32,
+    window: Duration,
+}
+
+impl SubscriptionRateLimiter {
+    pub fn new(limit: u32) -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+            limit: limit.max(1),
+            window: SUBSCRIPTION_RATE_WINDOW,
+        }
+    }
+
+    /// Attempt to record a request for `ip`.
+    ///
+    /// Returns `Ok(())` when the request is allowed, or `Err(retry_after_secs)`
+    /// when the per-IP limit has been exceeded for the current window.
+    pub fn check(&self, ip: IpAddr) -> Result<(), u64> {
+        let now = Instant::now();
+        let mut entry = self.inner.entry(ip).or_insert_with(|| WindowCounter {
+            window_start: now,
+            count: 0,
+        });
+
+        if now.duration_since(entry.window_start) >= self.window {
+            entry.window_start = now;
+            entry.count = 0;
+        }
+
+        if entry.count >= self.limit {
+            let elapsed = now.duration_since(entry.window_start);
+            let remaining = self.window.saturating_sub(elapsed);
+            // Round up so callers never see Retry-After: 0.
+            let secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            return Err(secs.max(1));
+        }
+
+        entry.count += 1;
+        Ok(())
+    }
+
+    /// Remove stale entries so the map does not grow unbounded.
+    pub fn prune(&self) {
+        let now = Instant::now();
+        self.inner
+            .retain(|_, counter| now.duration_since(counter.window_start) < self.window);
+    }
+
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+}
+
+/// DashMap-backed per-IP counter of *concurrent* SSE connections.
+#[derive(Debug, Clone)]
+pub struct SseConnectionLimiter {
+    inner: Arc<DashMap<IpAddr, AtomicUsize>>,
+    max: usize,
+}
+
+impl SseConnectionLimiter {
+    pub fn new(max: usize) -> Self {
+        Self {
+            inner: Arc::new(DashMap::new()),
+            max: max.max(1),
+        }
+    }
+
+    /// Try to acquire a connection slot for `ip`.
+    ///
+    /// On success returns a guard that releases the slot on drop, or
+    /// `Err(retry_after_secs)` when the per-IP connection cap is reached.
+    pub fn try_acquire(&self, ip: IpAddr) -> Result<SseConnectionGuard, u64> {
+        let entry = self
+            .inner
+            .entry(ip)
+            .or_insert_with(|| AtomicUsize::new(0));
+
+        let current = entry.load(Ordering::SeqCst);
+        if current >= self.max {
+            return Err(1);
+        }
+        entry.fetch_add(1, Ordering::SeqCst);
+        drop(entry);
+
+        Ok(SseConnectionGuard {
+            limiter: self.clone(),
+            ip,
+        })
+    }
+
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    fn release(&self, ip: IpAddr) {
+        if let Some(entry) = self.inner.get(&ip) {
+            // Saturating decrement; never underflow.
+            let _ = entry.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_sub(1))
+            });
+        }
+    }
+}
+
+/// RAII guard that releases an SSE connection slot when dropped.
+#[derive(Debug)]
+pub struct SseConnectionGuard {
+    limiter: SseConnectionLimiter,
+    ip: IpAddr,
+}
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        self.limiter.release(self.ip);
+    }
+}
+
+/// Build a `429 Too Many Requests` response with a `Retry-After` header.
+pub fn too_many_requests(retry_after_secs: u64, message: &str) -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(json!({ "error": message }))).into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.max(1).to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1404,6 +1556,45 @@ pub mod tests {
         // Advancing further works
         acked_ledger = new_ack(acked_ledger, 150);
         assert_eq!(acked_ledger, 150);
+    }
+
+    // --- Rate limiter tests (Issue #1268) ---
+
+    #[test]
+    fn subscription_rate_limiter_allows_five_then_rejects() {
+        let limiter = SubscriptionRateLimiter::new(5);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        for _ in 0..5 {
+            assert!(limiter.check(ip).is_ok());
+        }
+        let err = limiter.check(ip).expect_err("6th request must be rejected");
+        assert!(err >= 1, "Retry-After must be at least 1 second");
+    }
+
+    #[test]
+    fn subscription_rate_limiter_is_per_ip() {
+        let limiter = SubscriptionRateLimiter::new(5);
+        let ip_a: IpAddr = "203.0.113.7".parse().unwrap();
+        let ip_b: IpAddr = "203.0.113.8".parse().unwrap();
+        for _ in 0..5 {
+            assert!(limiter.check(ip_a).is_ok());
+        }
+        assert!(limiter.check(ip_a).is_err());
+        assert!(limiter.check(ip_b).is_ok(), "other IPs are unaffected");
+    }
+
+    #[test]
+    fn sse_connection_limiter_caps_concurrent_connections() {
+        let limiter = SseConnectionLimiter::new(5);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let mut guards = Vec::new();
+        for _ in 0..5 {
+            guards.push(limiter.try_acquire(ip).expect("within limit"));
+        }
+        assert!(limiter.try_acquire(ip).is_err(), "6th connection must be rejected");
+        // Dropping a guard frees a slot.
+        guards.pop();
+        assert!(limiter.try_acquire(ip).is_ok());
     }
 
     #[tokio::test]

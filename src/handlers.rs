@@ -209,6 +209,130 @@ fn compute_etag(last_id: &Uuid, last_created_at: &DateTime<Utc>, total: Option<i
     format!("\"{}\"", URL_SAFE_NO_PAD.encode(&digest[..8]))
 }
 
+// ── Issue #1268: per-IP rate limiting for subscriptions and SSE ─────────────
+
+/// Maximum number of `POST /v1/subscriptions` requests allowed per IP per minute.
+pub const SUBSCRIPTION_RATE_LIMIT_PER_MINUTE: usize = 5;
+
+/// Maximum number of concurrent SSE connections allowed per IP.
+pub const SSE_MAX_CONNECTIONS_PER_IP: usize = 5;
+
+/// Per-IP sliding-window limiter for webhook subscription registration.
+///
+/// Tracks request timestamps per client IP in a `DashMap`; requests older than
+/// one minute are pruned on each check. When the limit is exceeded the handler
+/// returns `429 Too Many Requests` with a `Retry-After` header.
+pub struct SubscriptionRateLimiter {
+    hits: dashmap::DashMap<String, Vec<std::time::Instant>>,
+    limit: usize,
+    window: std::time::Duration,
+}
+
+impl SubscriptionRateLimiter {
+    pub fn new(limit: usize, window: std::time::Duration) -> Self {
+        Self {
+            hits: dashmap::DashMap::new(),
+            limit,
+            window,
+        }
+    }
+
+    /// Record a hit for `ip`. Returns `Ok(())` when allowed, or `Err(retry_after_secs)`
+    /// when the per-IP limit has been exceeded.
+    pub fn check(&self, ip: &str) -> Result<(), u64> {
+        let now = std::time::Instant::now();
+        let mut entry = self.hits.entry(ip.to_string()).or_default();
+        entry.retain(|t| now.duration_since(*t) < self.window);
+        if entry.len() >= self.limit {
+            let oldest = entry.first().copied().unwrap_or(now);
+            let elapsed = now.duration_since(oldest);
+            let retry_after = self.window.saturating_sub(elapsed).as_secs().max(1);
+            return Err(retry_after);
+        }
+        entry.push(now);
+        Ok(())
+    }
+}
+
+/// Per-IP concurrent-connection limiter for SSE endpoints.
+///
+/// Uses a `DashMap` of active connection counts. A guard is returned on success
+/// and decrements the counter when dropped, so disconnects free the slot.
+pub struct SseConnectionLimiter {
+    active: dashmap::DashMap<String, usize>,
+    limit: usize,
+}
+
+/// RAII guard that releases an SSE connection slot on drop.
+pub struct SseConnectionGuard {
+    limiter: Arc<SseConnectionLimiter>,
+    ip: String,
+}
+
+impl Drop for SseConnectionGuard {
+    fn drop(&mut self) {
+        if let Some(mut count) = self.limiter.active.get_mut(&self.ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                drop(count);
+                self.limiter.active.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl SseConnectionLimiter {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            active: dashmap::DashMap::new(),
+            limit,
+        }
+    }
+
+    /// Try to acquire a connection slot for `ip`.
+    pub fn try_acquire(self: &Arc<Self>, ip: &str) -> Option<SseConnectionGuard> {
+        let mut entry = self.active.entry(ip.to_string()).or_insert(0);
+        if *entry >= self.limit {
+            return None;
+        }
+        *entry += 1;
+        drop(entry);
+        Some(SseConnectionGuard {
+            limiter: Arc::clone(self),
+            ip: ip.to_string(),
+        })
+    }
+}
+
+/// Extract the client IP from forwarding headers, falling back to `"unknown"`.
+fn client_ip_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Build a `429 Too Many Requests` response with a `Retry-After` header.
+fn too_many_requests(retry_after_secs: u64, message: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header(header::RETRY_AFTER, retry_after_secs.to_string())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({ "error": message, "retry_after": retry_after_secs }).to_string(),
+        ))
+        .unwrap()
+}
+
 /// Simple in-process cache entry for the contracts list.
 struct CacheEntry {
     data: Value,
@@ -5275,6 +5399,119 @@ pub async fn reindex_index(
             "message": "REINDEX INDEX CONCURRENTLY completed successfully"
         })),
     ))
+}
+
+/// Request body for `POST /v1/admin/encryption/rotate` (Issue #1270).
+#[derive(Debug, serde::Deserialize)]
+pub struct RotateEncryptionKeyRequest {
+    /// The new AES-GCM key (base64-encoded 32-byte key).
+    pub new_key: String,
+}
+
+/// Rotate the AES-GCM credential-encryption key without downtime (Issue #1270).
+///
+/// `POST /v1/admin/encryption/rotate`
+///
+/// Accepts `{ "new_key": "<base64 32-byte key>" }`, then starts a batched
+/// background job that decrypts every stored credential with the current key
+/// and re-encrypts it with `new_key`. The job commits in batches of 100 rows
+/// and can be resumed from where it stopped if interrupted.
+///
+/// This endpoint is gated behind `ADMIN_API_KEY` by the admin auth middleware.
+#[utoipa::path(
+    post,
+    path = "/v1/admin/encryption/rotate",
+    tag = "admin",
+    request_body(content = Value, description = "{\"new_key\": \"<base64 32-byte key>\"}", content_type = "application/json"),
+    responses(
+        (status = 202, description = "Key rotation job started"),
+        (status = 400, description = "Invalid or missing new_key", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 409, description = "A rotation job is already running", body = ErrorResponse),
+    )
+)]
+pub async fn rotate_encryption_key(
+    State(state): State<AppState>,
+    Json(body): Json<RotateEncryptionKeyRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+    // Validate the new key: must decode to exactly 32 bytes.
+    let new_key_bytes = STANDARD
+        .decode(body.new_key.trim())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "new_key must be valid base64" })),
+            )
+        })?;
+    if new_key_bytes.len() != 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "new_key must decode to exactly 32 bytes" })),
+        ));
+    }
+    let mut new_key = [0u8; 32];
+    new_key.copy_from_slice(&new_key_bytes);
+
+    // The current key is required to decrypt existing credentials.
+    let old_key = state.encryption_key.ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "no current encryption key configured (ENCRYPTION_KEY)"
+            })),
+        )
+    })?;
+
+    // Start the batched rotation job (100 rows per transaction).
+    let started = crate::reencrypt::start_rotation_job(
+        state.pool.clone(),
+        new_key,
+        old_key,
+        100,
+        state.reencrypt_state.clone(),
+    );
+
+    if !started {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "a key rotation job is already running" })),
+        ));
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "started",
+            "batch_size": 100,
+            "message": "key rotation started; poll /v1/admin/encryption/rotate/status for progress"
+        })),
+    ))
+}
+
+/// Report progress of the credential key-rotation job (Issue #1270).
+///
+/// `GET /v1/admin/encryption/rotate/status`
+#[utoipa::path(
+    get,
+    path = "/v1/admin/encryption/rotate/status",
+    tag = "admin",
+    responses(
+        (status = 200, description = "Rotation job status"),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+    )
+)]
+pub async fn get_encryption_rotation_status(
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let (completed, total, running) = state.reencrypt_state.progress();
+    Json(json!({
+        "running": running,
+        "completed": completed,
+        "total": total,
+        "progress": if total > 0 { completed as f64 / total as f64 } else { 0.0 },
+    }))
 }
 
 /// Start background re-encryption jobs after a key rotation.
@@ -16001,6 +16238,27 @@ pub async fn cleanup_export_files(
         "status": "cleaned",
         "removed_jobs": removed,
     })))
+}
+
+/// Register a webhook subscription (Issue #1268: per-IP rate limited to 5/min).
+///
+/// `POST /v1/subscriptions`
+pub async fn create_subscription(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let ip = client_ip_from_headers(&headers);
+    if let Err(retry_after) = state.subscription_rate_limiter.check(&ip) {
+        crate::metrics::record_subscription_rate_limited();
+        tracing::warn!(client_ip = %ip, "subscription registration rate limited");
+        return too_many_requests(retry_after, "too many subscription requests");
+    }
+
+    match crate::webhooks::create_subscription(&state.pool, payload).await {
+        Ok(subscription) => (StatusCode::CREATED, Json(subscription)).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Get cross-chain trace for a transaction

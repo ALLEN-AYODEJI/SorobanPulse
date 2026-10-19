@@ -221,6 +221,17 @@ pub fn update_reencrypt_progress(remaining: u64) {
     m::gauge!("soroban_pulse_reencrypt_progress").set(remaining as f64);
 }
 
+/// Update the key-rotation progress gauge as a fraction of rows completed
+/// (issue #1270). `rows_total == 0` reports 0.0 rather than NaN.
+pub fn update_reencryption_progress(rows_completed: u64, rows_total: u64) {
+    let ratio = if rows_total == 0 {
+        0.0
+    } else {
+        (rows_completed as f64 / rows_total as f64).clamp(0.0, 1.0)
+    };
+    m::gauge!("soroban_pulse_reencryption_progress").set(ratio);
+}
+
 /// Record a re-encryption error (issue #372)
 pub fn record_reencrypt_error() {
     m::counter!("soroban_pulse_reencrypt_errors_total").increment(1);
@@ -259,6 +270,18 @@ pub fn record_pubsub_ordering_key_set() {
 /// Record a rate-limited request rejection (429 Too Many Requests)
 pub fn record_rate_limit_rejected() {
     m::counter!("soroban_pulse_rate_limit_rejected_total").increment(1);
+}
+
+/// Record a subscription registration rejected by the per-IP rate limit
+/// (issue #1268).
+pub fn record_subscription_rate_limited() {
+    m::counter!("soroban_pulse_subscription_rate_limited_total").increment(1);
+}
+
+/// Record an SSE connection rejected by the per-IP connection limit
+/// (issue #1268).
+pub fn record_sse_rate_limited() {
+    m::counter!("soroban_pulse_sse_rate_limited_total").increment(1);
 }
 
 /// Record that a notification was suppressed by a suppression list.

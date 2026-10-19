@@ -662,8 +662,42 @@ DATABASE_URL=postgres://user:pass@localhost:5432/soroban_pulse_verify \
 | `ENVIRONMENT`       | Deployment environment (`development`/`staging`/`production`)                     | `development` |
 | `BEHIND_PROXY`      | Trust `X-Forwarded-For` from upstream proxy/load balancer                         | `false`       |
 | `DATABASE_URL_FILE` | Path to a file containing the database URL (takes precedence over `DATABASE_URL`) | —             |
+| `ALLOWED_CALLBACK_DOMAINS` | Comma-separated list of domains permitted as OAuth callback URLs (see below) | — (all rejected) |
 
 See the root [README](../README.md) for all other variables.
+
+### `ALLOWED_CALLBACK_DOMAINS`
+
+The GitHub, Slack, and Telegram integration handlers accept a callback URL as
+user input. Without validation, an attacker could point the callback at a
+malicious domain and have OAuth tokens or authorization codes redirected there.
+To prevent this, every callback URL is validated against an allowlist before it
+is stored.
+
+Set `ALLOWED_CALLBACK_DOMAINS` to a comma-separated list of trusted domains:
+
+```bash
+ALLOWED_CALLBACK_DOMAINS=app.example.com,integrations.example.com
+```
+
+Behaviour:
+
+- **Matching** — the host of the submitted callback URL must exactly match one
+  of the listed domains (case-insensitive). Subdomains are not implicitly
+  allowed; list each one explicitly (e.g. `app.example.com` does not permit
+  `evil.app.example.com`).
+- **Rejection** — if the callback URL's domain is not in the allowlist, the
+  handler responds with `400 Bad Request` and a clear error message, and the
+  URL is not persisted.
+- **Default** — when the variable is unset or empty, the allowlist is empty and
+  **all** callback URLs are rejected. This fail-closed default means you must
+  configure the variable to enable the integration flows.
+- **Validation** — URLs must be absolute and parseable; malformed URLs are
+  rejected with the same `400 Bad Request` response.
+
+Configure this variable in every environment where the integration handlers are
+exposed, and keep it in sync with the domains you actually control.
+=======
 
 ---
 
@@ -675,6 +709,7 @@ See the root [README](../README.md) for all other variables.
 - [ ] Certificates are auto-renewed (certbot timer or Caddy/ACM managed)
 - [ ] `ENVIRONMENT=production` is set in production
 - [ ] `ALLOWED_ORIGINS` lists only known domains (no `*`)
+- [ ] `ALLOWED_CALLBACK_DOMAINS` lists only trusted OAuth callback domains
 - [ ] `API_KEY` is set and rotated regularly
 - [ ] Secrets are managed via Docker Secrets, Kubernetes Secrets, or a vault — not plain `.env` files
 - [ ] Database backups are scheduled and restore procedure is tested

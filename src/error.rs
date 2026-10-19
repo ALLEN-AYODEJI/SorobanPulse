@@ -387,6 +387,9 @@ pub enum AppError {
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    #[error("Callback URL not allowed: {0}")]
+    CallbackUrlNotAllowed(String),
+
     #[error("Internal error: {0}")]
     // Reserved for surfacing raw internal errors in tests and future integrations;
     // not constructed in production paths today.
@@ -490,6 +493,11 @@ impl AppError {
         AppError::Forbidden(msg.into())
     }
 
+    /// Create an error indicating a callback URL was rejected by the allowlist.
+    pub fn callback_url_not_allowed(msg: impl Into<String>) -> Self {
+        AppError::CallbackUrlNotAllowed(msg.into())
+    }
+
     /// Create an unauthorized error.
     pub fn unauthorized() -> Self {
         AppError::Auth(AuthError::Unauthenticated)
@@ -516,6 +524,10 @@ impl AppError {
             }
 
             AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "FORBIDDEN"),
+
+            AppError::CallbackUrlNotAllowed(_) => {
+                (StatusCode::BAD_REQUEST, "CALLBACK_URL_NOT_ALLOWED")
+            }
 
             AppError::Auth(AuthError::Unauthenticated) | AppError::Auth(AuthError::TokenExpired) => {
                 (StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
@@ -599,6 +611,7 @@ impl AppError {
             AppError::Validation(msg) => (msg.clone(), None),
             AppError::ValidationWithDetails(msg, errors) => (msg.clone(), Some(errors.clone())),
             AppError::Forbidden(msg) => (msg.clone(), None),
+            AppError::CallbackUrlNotAllowed(msg) => (msg.clone(), None),
             AppError::Auth(AuthError::Forbidden(msg)) => (msg.clone(), None),
             AppError::DatabaseDomain(DatabaseError::NotFound(msg)) => (msg.clone(), None),
             AppError::DatabaseDomain(DatabaseError::UniqueViolation(msg)) => (msg.clone(), None),
@@ -780,6 +793,7 @@ pub fn generate_error_docs() -> String {
     doc.push_str("| `Validation(msg)` | 400 | VALIDATION_ERROR | Invalid input provided |\n");
     doc.push_str("| `ValidationWithDetails(msg, errors)` | 400 | VALIDATION_ERROR | Validation with field details |\n");
     doc.push_str("| `Forbidden(msg)` | 403 | FORBIDDEN | Access denied |\n");
+    doc.push_str("| `CallbackUrlNotAllowed(msg)` | 400 | CALLBACK_URL_NOT_ALLOWED | Callback URL domain not in allowlist |\n");
     doc.push_str("| `Auth(AuthError::Unauthenticated)` | 401 | UNAUTHORIZED | Missing or invalid credentials |\n");
     doc.push_str("| `Auth(AuthError::TokenExpired)` | 401 | UNAUTHORIZED | Authentication token expired |\n");
     doc.push_str("| `Database(sqlx::Error)` | 500 | DATABASE_ERROR | Database operation failed |\n");
@@ -955,6 +969,15 @@ mod tests {
     fn forbidden_constructor_works() {
         let e = AppError::forbidden("denied");
         assert_eq!(e.status_and_code(), (StatusCode::FORBIDDEN, "FORBIDDEN"));
+    }
+
+    #[test]
+    fn callback_url_not_allowed_maps_to_400() {
+        let e = AppError::callback_url_not_allowed("domain not allowed");
+        assert_eq!(
+            e.status_and_code(),
+            (StatusCode::BAD_REQUEST, "CALLBACK_URL_NOT_ALLOWED")
+        );
     }
 
     #[test]
