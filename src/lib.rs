@@ -47,6 +47,8 @@ pub mod event_simulator;
 pub mod event_aggregation;
 pub mod time_series;
 pub mod anomaly_detection;
+pub mod derived_metrics;
+pub mod incident_correlation;
 pub mod gdpr;
 pub mod graceful_shutdown;
 pub mod handlers;
