@@ -1,5 +1,44 @@
 # Deployment Guide
 
+## Installing from the Helm repository
+
+The Helm chart in `helm/soroban-pulse/` is published to GitHub Pages (the
+`gh-pages` branch) by `.github/workflows/helm-release.yml` on each release, so
+you can install it without cloning the repository. Chart versions track the
+application version tag — the chart released alongside `v1.2.3` is version
+`1.2.3`.
+
+```bash
+# Add the repository (replace <org> with the GitHub organisation/user)
+helm repo add soroban-pulse https://<org>.github.io/SorobanPulse
+
+# Refresh the local index
+helm repo update
+
+# Confirm the chart is available
+helm search repo soroban-pulse
+```
+
+Then install the chart:
+
+```bash
+helm install soroban-pulse soroban-pulse/soroban-pulse \
+  --namespace soroban-pulse --create-namespace \
+  --set resources.requests.memory=512Mi \
+  --set resources.limits.memory=1Gi
+```
+
+To upgrade an existing release to the latest published chart version:
+
+```bash
+helm repo update
+helm upgrade soroban-pulse soroban-pulse/soroban-pulse
+```
+
+To pin a specific release, pass `--version <chart-version>` (e.g.
+`--version 1.2.3`). The `resources` overrides shown above work the same way as
+when installing from a local checkout (see [Resource Sizing](#resource-sizing)).
+
 ## Resource Sizing
 
 ### Recommended defaults
