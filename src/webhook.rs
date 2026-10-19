@@ -233,6 +233,13 @@ pub async fn deliver_with_retry_policy(
                 let send_result = req.send().await;
                 let duration_ms = started_at.elapsed().as_millis() as i64;
 
+                // Record the notification delivery cost for this attempt,
+                // attributed to the webhook component (Issue #1264).
+                crate::costs::calculator::record_notification_cost(
+                    "webhook",
+                    duration_ms as u64,
+                );
+
                 let outcome = match send_result {
                     Ok(resp) if resp.status().is_success() => {
                         info!(

@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use chrono::{DateTime, Utc};
@@ -13,7 +13,7 @@ use tokio::time::sleep;
 use url::Url;
 use uuid::Uuid;
 
-use crate::{config::Environment, error::AppError, routes::AppState};
+use crate::{config::Environment, error::AppError, idempotency, routes::AppState};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -234,8 +234,23 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 
 pub async fn create_subscription(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateSubscriptionRequest>,
 ) -> Result<(StatusCode, Json<Value>), AppError> {
+    // Idempotency: if the client supplied an `Idempotency-Key`, replay the
+    // cached response for identical retries instead of creating a duplicate.
+    let idem_key = idempotency::scoped_key("POST /v1/subscriptions", &headers);
+    let request_hash = idempotency::hash_request(&body);
+
+    if let Some(ref key) = idem_key {
+        if let Some(cached) = idempotency::lookup(&state.pool, key, &request_hash).await? {
+            return Ok((
+                StatusCode::from_u16(cached.status_code).unwrap_or(StatusCode::CREATED),
+                Json(cached.response_body),
+            ));
+        }
+    }
+
     if body.callback_url.is_empty() {
         return Err(AppError::Validation("callback_url is required".into()));
     }
@@ -290,7 +305,21 @@ pub async fn create_subscription(
     .execute(&state.pool)
     .await?;
 
-    Ok((StatusCode::CREATED, Json(json!(sub))))
+    let response_body = json!(sub);
+
+    // Persist the response so retries with the same key replay it (24h TTL).
+    if let Some(ref key) = idem_key {
+        idempotency::store(
+            &state.pool,
+            key,
+            &request_hash,
+            StatusCode::CREATED.as_u16(),
+            &response_body,
+        )
+        .await?;
+    }
+
+    Ok((StatusCode::CREATED, Json(response_body)))
 }
 
 pub async fn get_subscription(

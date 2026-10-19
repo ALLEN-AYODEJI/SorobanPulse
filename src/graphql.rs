@@ -15,6 +15,131 @@ use uuid::Uuid;
 
 use crate::models::SorobanEvent;
 
+/// Default maximum query depth allowed by the GraphQL endpoint.
+pub const DEFAULT_GRAPHQL_MAX_DEPTH: usize = 10;
+/// Default maximum query complexity allowed by the GraphQL endpoint.
+pub const DEFAULT_GRAPHQL_MAX_COMPLEXITY: usize = 1000;
+/// Default maximum number of aliases allowed in a single query.
+pub const DEFAULT_GRAPHQL_MAX_ALIASES: usize = 15;
+
+/// Resolve the maximum query depth from `GRAPHQL_MAX_DEPTH`, falling back to the default.
+pub fn graphql_max_depth() -> usize {
+    std::env::var("GRAPHQL_MAX_DEPTH")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GRAPHQL_MAX_DEPTH)
+}
+
+/// Resolve the maximum query complexity from `GRAPHQL_MAX_COMPLEXITY`, falling back to the default.
+pub fn graphql_max_complexity() -> usize {
+    std::env::var("GRAPHQL_MAX_COMPLEXITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GRAPHQL_MAX_COMPLEXITY)
+}
+
+/// Resolve the maximum number of aliases from `GRAPHQL_MAX_ALIASES`, falling back to the default.
+pub fn graphql_max_aliases() -> usize {
+    std::env::var("GRAPHQL_MAX_ALIASES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_GRAPHQL_MAX_ALIASES)
+}
+
+/// Build the structured error returned when a query exceeds a configured limit.
+fn limit_exceeded_error(limit: &str, max: usize) -> async_graphql::Error {
+    async_graphql::Error::new(format!(
+        "Query exceeds the maximum allowed {limit} of {max}"
+    ))
+    .extend_with(|_, e| {
+        e.set("code", "GRAPHQL_LIMIT_EXCEEDED");
+        e.set("limit", limit);
+        e.set("max", max as i64);
+    })
+}
+
+/// Compute the maximum selection depth of a document.
+fn selection_set_depth(selection_set: &SelectionSet) -> usize {
+    selection_set
+        .items
+        .iter()
+        .map(|item| match item {
+            Selection::Field(field) => 1 + selection_set_depth(&field.node.selection_set),
+            Selection::FragmentSpread(_) => 1,
+            Selection::InlineFragment(fragment) => 1 + selection_set_depth(&fragment.node.selection_set),
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Count the number of aliased fields in a document.
+fn count_aliases(selection_set: &SelectionSet) -> usize {
+    selection_set
+        .items
+        .iter()
+        .map(|item| match item {
+            Selection::Field(field) => {
+                let aliased = if field.node.alias.is_some() { 1 } else { 0 };
+                aliased + count_aliases(&field.node.selection_set)
+            }
+            Selection::FragmentSpread(_) => 0,
+            Selection::InlineFragment(fragment) => count_aliases(&fragment.node.selection_set),
+        })
+        .sum()
+}
+
+/// Extension enforcing depth and alias limits on parsed queries.
+struct QueryLimitsExtension {
+    max_depth: usize,
+    max_aliases: usize,
+}
+
+impl ExtensionFactory for QueryLimitsExtension {
+    fn create(&self) -> Arc<dyn Extension> {
+        Arc::new(QueryLimitsExtension {
+            max_depth: self.max_depth,
+            max_aliases: self.max_aliases,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl Extension for QueryLimitsExtension {
+    async fn parse_query(
+        &self,
+        ctx: &ExtensionContext<'_>,
+        query: &str,
+        variables: &Value,
+        next: NextParseQuery<'_>,
+    ) -> ServerResult<ExecutableDocument> {
+        let document = next.run(ctx, query, variables).await?;
+
+        let depth = document
+            .operations
+            .iter()
+            .map(|(_, op)| selection_set_depth(&op.node.selection_set))
+            .max()
+            .unwrap_or(0);
+        if depth > self.max_depth {
+            return Err(limit_exceeded_error("depth", self.max_depth));
+        }
+
+        let aliases: usize = document
+            .operations
+            .iter()
+            .map(|(_, op)| count_aliases(&op.node.selection_set))
+            .sum();
+        if aliases > self.max_aliases {
+            return Err(limit_exceeded_error("aliases", self.max_aliases));
+        }
+
+        Ok(document)
+    }
+}
+
 /// GraphQL representation of a Soroban event
 #[derive(Clone, Debug, Serialize, Deserialize, SimpleObject)]
 pub struct Event {
@@ -431,10 +556,81 @@ impl Subscription {
     }
 }
 
-/// Create the GraphQL schema
+/// Create the GraphQL schema with depth, complexity, and alias guards applied.
 pub fn create_schema(
 ) -> Schema<Query, async_graphql::EmptyMutation, Subscription> {
-    Schema::build(Query, async_graphql::EmptyMutation, Subscription).finish()
+    Schema::build(Query, async_graphql::EmptyMutation, Subscription)
+        .limit_depth(graphql_max_depth())
+        .limit_complexity(graphql_max_complexity())
+        .extension(QueryLimitsExtension {
+            max_depth: graphql_max_depth(),
+            max_aliases: graphql_max_aliases(),
+        })
+        .finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema() -> Schema<Query, async_graphql::EmptyMutation, Subscription> {
+        create_schema()
+    }
+
+    #[tokio::test]
+    async fn legitimate_query_is_unaffected() {
+        let res = schema()
+            .execute("{ eventStats { totalEvents } }")
+            .await;
+        assert!(res.errors.is_empty(), "unexpected errors: {:?}", res.errors);
+    }
+
+    #[tokio::test]
+    async fn query_exceeding_depth_is_rejected() {
+        // Build a query nested deeper than the default depth limit.
+        let mut query = String::from("{ eventStats { totalEvents");
+        for _ in 0..(DEFAULT_GRAPHQL_MAX_DEPTH + 2) {
+            query.push_str(" eventsByType { eventType }");
+        }
+        query.push_str(" } }");
+
+        let res = schema().execute(&query).await;
+        assert!(!res.errors.is_empty());
+        let msg = format!("{:?}", res.errors);
+        assert!(msg.contains("depth"), "expected depth error, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn query_exceeding_alias_limit_is_rejected() {
+        let mut query = String::from("{");
+        for i in 0..(DEFAULT_GRAPHQL_MAX_ALIASES + 2) {
+            query.push_str(&format!(" a{i}: eventStats {{ totalEvents }}"));
+        }
+        query.push('}');
+
+        let res = schema().execute(&query).await;
+        assert!(!res.errors.is_empty());
+        let msg = format!("{:?}", res.errors);
+        assert!(msg.contains("aliases"), "expected alias error, got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn query_exceeding_complexity_is_rejected() {
+        // Many fields push complexity above the configured limit.
+        let mut query = String::from("{");
+        for i in 0..(DEFAULT_GRAPHQL_MAX_COMPLEXITY + 10) {
+            query.push_str(&format!(" f{i}: eventStats {{ totalEvents }}"));
+        }
+        query.push('}');
+
+        let res = schema().execute(&query).await;
+        assert!(!res.errors.is_empty());
+        let msg = format!("{:?}", res.errors);
+        assert!(
+            msg.contains("complexity") || msg.contains("aliases"),
+            "expected complexity error, got: {msg}"
+        );
+    }
 }
 
 #[cfg(test)]
