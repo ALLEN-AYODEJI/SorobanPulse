@@ -7926,6 +7926,38 @@ mod tests {
         assert!(validate_tx_hash(&"A".repeat(64)).is_ok());
     }
 
+    // --- Fuzz regressions (issues #1227, #1229): multi-byte UTF-8 inputs ---
+
+    #[test]
+    fn validate_contract_id_multibyte_with_56_byte_len_returns_err() {
+        // 'é' is 2 bytes, so this is 56 bytes but only 55 chars.
+        let s = format!("C{}é", "A".repeat(53));
+        assert_eq!(s.len(), 56);
+        assert!(validate_contract_id(&s).is_err());
+    }
+
+    #[test]
+    fn validate_contract_id_multibyte_leading_char_returns_err() {
+        let s = format!("Ç{}", "A".repeat(54));
+        assert_eq!(s.len(), 56);
+        assert!(validate_contract_id(&s).is_err());
+    }
+
+    #[test]
+    fn validate_tx_hash_multibyte_with_64_byte_len_returns_err() {
+        let s = format!("{}é", "a".repeat(62));
+        assert_eq!(s.len(), 64);
+        assert!(validate_tx_hash(&s).is_err());
+    }
+
+    #[test]
+    fn validate_tx_hash_non_ascii_digits_returns_err() {
+        // Fullwidth digits are numeric but not ASCII hex.
+        let s = format!("{}０", "a".repeat(61));
+        assert_eq!(s.len(), 64);
+        assert!(validate_tx_hash(&s).is_err());
+    }
+
     #[sqlx::test(migrations = "./migrations")]
     async fn stream_events_invalid_contract_id_returns_400(pool: PgPool) {
         let app = create_test_router(pool);
