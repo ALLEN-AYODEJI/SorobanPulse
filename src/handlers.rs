@@ -4926,15 +4926,14 @@ pub async fn delete_contract_events(
 )]
 pub async fn pause_indexer(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, AppError> {
     if !state
         .indexer_state
         .is_active_indexer
         .load(Ordering::Relaxed)
     {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "pause endpoint only available on active indexer" })),
+        return Err(AppError::Forbidden(
+            "pause endpoint only available on active indexer".to_string(),
         ));
     }
     state.indexer_state.is_paused.store(true, Ordering::Relaxed);
@@ -4955,15 +4954,14 @@ pub async fn pause_indexer(
 )]
 pub async fn resume_indexer(
     State(state): State<AppState>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<Value>, AppError> {
     if !state
         .indexer_state
         .is_active_indexer
         .load(Ordering::Relaxed)
     {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "resume endpoint only available on active indexer" })),
+        return Err(AppError::Forbidden(
+            "resume endpoint only available on active indexer".to_string(),
         ));
     }
     state
@@ -4974,51 +4972,78 @@ pub async fn resume_indexer(
     Ok(Json(json!({ "indexer_paused": false })))
 }
 
-/// Stream events over Server-Sent Events (Issue #1268: per-IP connection limited).
+/// Operational cost report with per-component breakdown and a linear forecast
+/// (Issue #1264).
 ///
-/// `GET /v1/events/stream`
-pub async fn stream_events(
+/// `GET /v1/admin/costs/report`
+///
+/// Aggregates the hourly `cost_snapshots` rows over the requested window
+/// (default: last 24 hours) and returns the cost breakdown by component
+/// (`rpc`, `db`, `notification`) together with a forecast for the next window
+/// produced by the linear model in `costs::forecast`.
+#[utoipa::path(
+    get,
+    path = "/v1/admin/costs/report",
+    tag = "admin",
+    params(
+        ("hours" = Option<i64>, Query, description = "Lookback window in hours (default 24)"),
+        ("forecast_hours" = Option<i64>, Query, description = "Forecast horizon in hours (default 24)"),
+    ),
+    responses(
+        (status = 200, description = "Cost breakdown by component with forecast", body = Value),
+        (status = 400, description = "Invalid query parameters", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 500, description = "Failed to generate cost report", body = ErrorResponse),
+    )
+)]
+pub async fn get_cost_report(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(params): Query<StreamParams>,
-) -> Response {
-    let ip = client_ip_from_headers(&headers);
-
-    // Enforce the per-IP concurrent SSE connection limit.
-    let guard = match state.sse_connection_limiter.try_acquire(&ip) {
-        Some(guard) => guard,
-        None => {
-            crate::metrics::record_sse_rate_limited();
-            tracing::warn!(client_ip = %ip, "SSE connection limit reached");
-            return too_many_requests(60, "too many concurrent SSE connections");
-        }
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let hours = match params.get("hours") {
+        Some(raw) => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|h| *h > 0 && *h <= 24 * 90)
+            .ok_or_else(|| {
+                AppError::Validation("hours must be an integer between 1 and 2160".to_string())
+            })?,
+        None => 24,
+    };
+    let forecast_hours = match params.get("forecast_hours") {
+        Some(raw) => raw
+            .parse::<i64>()
+            .ok()
+            .filter(|h| *h > 0 && *h <= 24 * 90)
+            .ok_or_else(|| {
+                AppError::Validation(
+                    "forecast_hours must be an integer between 1 and 2160".to_string(),
+                )
+            })?,
+        None => 24,
     };
 
-    let pool = state.read_pool.clone();
-    let interval = Duration::from_secs(1);
+    let report = crate::costs::report::generate_report(&state.read_pool, hours)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to generate cost report: {e}")))?;
 
-    // The stream owns the guard so the slot is released when the client disconnects.
-    let stream = stream::unfold(
-        (pool, params, interval, guard, false),
-        |(pool, params, interval, guard, mut sent_initial)| {
-            async move {
-                if !sent_initial {
-                    sent_initial = true;
-                    let event = Event::default()
-                        .event("connected")
-                        .data(json!({ "status": "connected" }).to_string());
-                    return Some((Ok::<_, Infallible>(event), (pool, params, interval, guard, sent_initial)));
-                }
-                tokio::time::sleep(interval).await;
-                let event = Event::default()
-                    .event("heartbeat")
-                    .data(json!({ "ts": Utc::now() }).to_string());
-                Some((Ok::<_, Infallible>(event), (pool, params, interval, guard, sent_initial)))
-            }
+    let forecast = crate::costs::report::generate_forecast(&state.read_pool, forecast_hours)
+        .await
+        .map_err(|e| AppError::Internal(format!("failed to generate cost forecast: {e}")))?;
+
+    Ok(Json(json!({
+        "window_hours": hours,
+        "total_cost": report.total_cost,
+        "breakdown": report.by_component,
+        "snapshots": report.snapshot_count,
+        "forecast": {
+            "horizon_hours": forecast_hours,
+            "predicted_cost": forecast.predicted_cost,
+            "slope": forecast.slope,
+            "intercept": forecast.intercept,
+            "confidence": forecast.confidence,
         },
-    );
-
-    Sse::new(stream).into_response()
+    })))
 }
 
 /// Get current database connection pool statistics
@@ -15815,6 +15840,311 @@ pub async fn reset_circuit_breaker(
         "status": "reset",
         "endpoint": endpoint,
     }))
+}
+
+// ── Issue #1260: Webhook Dead-Letter Queue Admin Endpoints ──────────────────
+
+/// GET /v1/admin/webhook-dlq
+///
+/// Paginated listing of webhook deliveries that exhausted all retries.
+/// Supports `page`/`limit` (or `offset`/`limit`) and an optional
+/// `subscription_id` filter.
+pub async fn list_webhook_dlq(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let offset = match params.get("offset").and_then(|v| v.parse::<i64>().ok()) {
+        Some(o) => o.max(0),
+        None => {
+            let page = params
+                .get("page")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(1)
+                .max(1);
+            (page - 1) * limit
+        }
+    };
+    let subscription_id = params.get("subscription_id").cloned();
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "SELECT id, subscription_id, event_id, payload, last_error, failed_at, replayed_at \
+         FROM webhook_dlq",
+    );
+    if subscription_id.is_some() {
+        qb.push(" WHERE subscription_id = ");
+        qb.push_bind(subscription_id.clone());
+    }
+    qb.push(" ORDER BY failed_at DESC, id DESC LIMIT ");
+    qb.push_bind(limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+
+    let rows = qb.build().fetch_all(&state.read_pool).await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: Uuid = row.try_get("id")?;
+        let sub_id: Option<Uuid> = row.try_get("subscription_id")?;
+        let event_id: Option<Uuid> = row.try_get("event_id")?;
+        let payload: Value = row.try_get("payload")?;
+        let last_error: Option<String> = row.try_get("last_error")?;
+        let failed_at: DateTime<Utc> = row.try_get("failed_at")?;
+        let replayed_at: Option<DateTime<Utc>> = row.try_get("replayed_at")?;
+        items.push(json!({
+            "id": id,
+            "subscription_id": sub_id,
+            "event_id": event_id,
+            "payload": payload,
+            "last_error": last_error,
+            "failed_at": failed_at,
+            "replayed_at": replayed_at,
+        }));
+    }
+
+    let total: i64 = match &subscription_id {
+        Some(sub) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_dlq WHERE subscription_id = $1")
+                .bind(sub)
+                .fetch_one(&state.read_pool)
+                .await?
+        }
+        None => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM webhook_dlq")
+                .fetch_one(&state.read_pool)
+                .await?
+        }
+    };
+
+    crate::metrics::set_webhook_dlq_depth(total);
+
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+/// POST /v1/admin/webhook-dlq/{id}/replay
+///
+/// Re-enqueues a single dead-lettered webhook into the normal delivery queue
+/// and stamps `replayed_at`.
+pub async fn replay_webhook_dlq_entry(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let row = sqlx::query(
+        "SELECT id, subscription_id, event_id, payload FROM webhook_dlq WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    let subscription_id: Option<Uuid> = row.try_get("subscription_id")?;
+    let event_id: Option<Uuid> = row.try_get("event_id")?;
+    let payload: Value = row.try_get("payload")?;
+
+    crate::webhook::enqueue_replay(&state.pool, subscription_id, event_id, payload).await?;
+
+    sqlx::query("UPDATE webhook_dlq SET replayed_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+
+    tracing::info!(dlq_id = %id, "Webhook DLQ entry replayed");
+
+    Ok(Json(json!({
+        "id": id,
+        "status": "replayed",
+        "subscription_id": subscription_id,
+        "event_id": event_id,
+    })))
+}
+
+/// DELETE /v1/admin/webhook-dlq/{id}
+///
+/// Permanently discards a dead-lettered webhook.
+pub async fn delete_webhook_dlq_entry(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, AppError> {
+    let result = sqlx::query("DELETE FROM webhook_dlq WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    tracing::info!(dlq_id = %id, "Webhook DLQ entry deleted");
+    Ok(Json(json!({ "id": id, "status": "deleted" })))
+}
+
+/// POST /v1/admin/webhook-dlq/replay
+///
+/// Bulk replay of dead-lettered webhooks. Accepts an optional JSON body
+/// `{ "subscription_id": "<uuid>", "limit": <n> }` to restrict the replay to
+/// a single subscription and cap the number of entries processed.
+pub async fn bulk_replay_webhook_dlq(
+    State(state): State<AppState>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, AppError> {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let subscription_id = body
+        .get("subscription_id")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+    let limit = body
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(1000)
+        .clamp(1, 10_000);
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "SELECT id, subscription_id, event_id, payload FROM webhook_dlq WHERE replayed_at IS NULL",
+    );
+    if subscription_id.is_some() {
+        qb.push(" AND subscription_id = ");
+        qb.push_bind(subscription_id.clone());
+    }
+    qb.push(" ORDER BY failed_at ASC LIMIT ");
+    qb.push_bind(limit);
+
+    let rows = qb.build().fetch_all(&state.pool).await?;
+
+    let mut replayed = 0u64;
+    let mut errors = 0u64;
+    for row in &rows {
+        let id: Uuid = row.try_get("id")?;
+        let sub_id: Option<Uuid> = row.try_get("subscription_id")?;
+        let event_id: Option<Uuid> = row.try_get("event_id")?;
+        let payload: Value = row.try_get("payload")?;
+
+        match crate::webhook::enqueue_replay(&state.pool, sub_id, event_id, payload).await {
+            Ok(()) => {
+                sqlx::query("UPDATE webhook_dlq SET replayed_at = NOW() WHERE id = $1")
+                    .bind(id)
+                    .execute(&state.pool)
+                    .await?;
+                replayed += 1;
+            }
+            Err(e) => {
+                errors += 1;
+                tracing::error!(dlq_id = %id, error = %e, "Failed to replay webhook DLQ entry");
+            }
+        }
+    }
+
+    tracing::info!(
+        replayed = replayed,
+        errors = errors,
+        subscription_id = subscription_id.as_deref().unwrap_or("-"),
+        "Bulk webhook DLQ replay completed"
+    );
+
+    Ok(Json(json!({
+        "status": "completed",
+        "replayed": replayed,
+        "errors": errors,
+        "subscription_id": subscription_id,
+    })))
+}
+
+// ── Issue #1263: Incident Correlation Admin Endpoint ───────────────────────
+
+/// GET /v1/admin/incidents
+///
+/// Paginated listing of correlated incidents. Supports `page`/`limit` (or
+/// `offset`/`limit`) and an optional `status` filter.
+pub async fn list_incidents(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, AppError> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
+    let offset = match params.get("offset").and_then(|v| v.parse::<i64>().ok()) {
+        Some(o) => o.max(0),
+        None => {
+            let page = params
+                .get("page")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(1)
+                .max(1);
+            (page - 1) * limit
+        }
+    };
+    let status = params.get("status").cloned();
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "SELECT id, title, status, severity, correlation_key, event_count, \
+                first_seen_at, last_seen_at, created_at, updated_at \
+         FROM incidents",
+    );
+    if status.is_some() {
+        qb.push(" WHERE status = ");
+        qb.push_bind(status.clone());
+    }
+    qb.push(" ORDER BY last_seen_at DESC, id DESC LIMIT ");
+    qb.push_bind(limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+
+    let rows = qb.build().fetch_all(&state.read_pool).await?;
+
+    let mut items = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let id: Uuid = row.try_get("id")?;
+        let title: String = row.try_get("title")?;
+        let status: String = row.try_get("status")?;
+        let severity: String = row.try_get("severity")?;
+        let correlation_key: Option<String> = row.try_get("correlation_key")?;
+        let event_count: i32 = row.try_get("event_count")?;
+        let first_seen_at: DateTime<Utc> = row.try_get("first_seen_at")?;
+        let last_seen_at: DateTime<Utc> = row.try_get("last_seen_at")?;
+        let created_at: DateTime<Utc> = row.try_get("created_at")?;
+        let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
+        items.push(json!({
+            "id": id,
+            "title": title,
+            "status": status,
+            "severity": severity,
+            "correlation_key": correlation_key,
+            "event_count": event_count,
+            "first_seen_at": first_seen_at,
+            "last_seen_at": last_seen_at,
+            "created_at": created_at,
+            "updated_at": updated_at,
+        }));
+    }
+
+    let total: i64 = match &status {
+        Some(s) => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM incidents WHERE status = $1")
+                .bind(s)
+                .fetch_one(&state.read_pool)
+                .await?
+        }
+        None => {
+            sqlx::query_scalar("SELECT COUNT(*) FROM incidents")
+                .fetch_one(&state.read_pool)
+                .await?
+        }
+    };
+
+    Ok(Json(json!({
+        "items": items,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    })))
 }
 
 // ── Issue #881: Bulk Event Export Endpoints ────────────────────────────────
