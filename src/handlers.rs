@@ -583,7 +583,11 @@ pub(crate) fn validate_ledger_param(name: &str, value: i64) -> Result<(), AppErr
     Ok(())
 }
 
-pub(crate) fn validate_contract_id(contract_id: &str) -> Result<(), AppError> {
+/// Validate a `contract_id` query/path parameter.
+///
+/// `pub` (not `pub(crate)`) because `fuzz/fuzz_targets/fuzz_validate_contract_id.rs`
+/// links this crate as an external dependency.
+pub fn validate_contract_id(contract_id: &str) -> Result<(), AppError> {
     if contract_id.len() != 56 {
         return Err(AppError::Validation(
             "invalid contract_id format".to_string(),
@@ -602,7 +606,11 @@ pub(crate) fn validate_contract_id(contract_id: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn validate_tx_hash(tx_hash: &str) -> Result<(), AppError> {
+/// Validate a `tx_hash` query/path parameter.
+///
+/// `pub` (not `pub(crate)`) because `fuzz/fuzz_targets/fuzz_validate_tx_hash.rs`
+/// links this crate as an external dependency.
+pub fn validate_tx_hash(tx_hash: &str) -> Result<(), AppError> {
     if tx_hash.len() != 64 {
         return Err(AppError::Validation("invalid tx_hash format".to_string()));
     }
@@ -7868,6 +7876,16 @@ mod tests {
         assert!(validate_contract_id(&s).is_ok());
     }
 
+    /// Fuzz regression (#1233): `len()` counts bytes, so multi-byte UTF-8 input
+    /// that is exactly 56 bytes long must still be rejected, deterministically.
+    #[test]
+    fn validate_contract_id_multibyte_56_bytes_returns_err() {
+        let s = format!("C{}A", "\u{e9}".repeat(27));
+        assert_eq!(s.len(), 56);
+        assert!(validate_contract_id(&s).is_err());
+        assert!(validate_contract_id(&s).is_err());
+    }
+
     #[test]
     fn validate_tx_hash_empty_returns_err() {
         assert!(validate_tx_hash("").is_err());
@@ -7886,6 +7904,16 @@ mod tests {
     #[test]
     fn validate_tx_hash_non_hex_returns_err() {
         assert!(validate_tx_hash(&"g".repeat(64)).is_err());
+    }
+
+    /// Fuzz regression (#1234): `len()` counts bytes, so multi-byte UTF-8 input
+    /// that is exactly 64 bytes long must still be rejected, deterministically.
+    #[test]
+    fn validate_tx_hash_multibyte_64_bytes_returns_err() {
+        let s = "\u{e9}".repeat(32);
+        assert_eq!(s.len(), 64);
+        assert!(validate_tx_hash(&s).is_err());
+        assert!(validate_tx_hash(&s).is_err());
     }
 
     #[test]
