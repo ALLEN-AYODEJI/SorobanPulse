@@ -225,6 +225,23 @@ cargo fuzz run fuzz_validate_contract_id
 
 Corpus and crash artifacts are stored under `fuzz/corpus/` and `fuzz/artifacts/` respectively (both git-ignored). The CI pipeline runs fuzz tests for 60 seconds per target on every push and PR, and stores corpus artifacts for 30 days to accumulate interesting inputs over time.
 
+## Benchmarking
+
+Performance benchmarks use Criterion and run automatically on every PR. A regression gate fails CI if any benchmark regresses by more than 15%.
+
+**Benchmark gate policy:**
+- PRs that regress p99 latency by >15% fail CI
+- Baseline is always the latest commit on `main`
+- A comment is posted to the PR with regression details
+
+Run benchmarks locally:
+
+```bash
+cargo bench
+```
+
+The `bench` job in CI is non-blocking for main branch builds, but **blocking** for PRs with a 15% regression threshold.
+
 ## Pre-commit Hooks
 
 This project uses [lefthook](https://github.com/evilmartians/lefthook) to run `cargo check`, `cargo fmt --check`, and `cargo clippy` before every commit.
@@ -243,6 +260,29 @@ lefthook install
 ```
 
 Hooks typically complete in under 30 seconds on a typical change. If a hook fails, fix the reported issue and re-commit.
+
+## Dependency Management
+
+### Automated Dependency Updates
+
+Dependabot runs daily for Cargo, Docker, and GitHub Actions dependencies. Patch-level updates that pass CI are automatically merged without manual review.
+
+**Auto-merge policy:**
+- Patch version bumps (e.g., `1.2.3` → `1.2.4`) merge automatically after CI passes
+- Minor and major updates require manual review
+- All auto-merged PRs must have the `dependencies` label
+
+**Security audits:**
+- `cargo-audit` runs daily at 2 AM UTC
+- New CVEs trigger a Security Advisory issue within 24 hours
+- Issues are tagged with `security`, `automated`, and `priority: critical`
+
+Run security audits locally:
+
+```bash
+cargo install cargo-audit
+cargo audit
+```
 
 ## Dependency License Policy
 
@@ -484,6 +524,20 @@ Before requesting review, verify that the change is scoped to the issue, tests c
 - Fill in every section of the [PR template](.github/pull_request_template.md).
 - Use Conventional Commits for all commit messages in the PR.
 - Respond to review feedback within 7 days; PRs left without a response may be closed and the issue released.
+
+### Path-Filtered CI
+
+CI jobs use path filters to reduce wall-clock time. Only jobs relevant to your changes will run:
+
+| Path Changed | Triggered Jobs |
+|--------------|----------------|
+| `src/**`, `tests/**`, `Cargo.*` | Rust tests, clippy, format |
+| `sdk/typescript/**` | TypeScript SDK CI only |
+| `sdk/python/**` | Python SDK CI only |
+| `terraform/**` | Terraform validation only |
+| `migrations/**` | Migration checks only |
+
+The `ci-success` job always runs to keep branch protection requirements stable, even when specific jobs are skipped.
 
 ## Releases
 
