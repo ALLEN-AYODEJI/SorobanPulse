@@ -137,7 +137,10 @@ web-build: ## Build the web dashboard for production
 web-lint: ## Lint and type-check the web dashboard
 	cd web && npm ci && npm run lint && npm run typecheck
 
-.PHONY: web-dev web-build web-lint
+web-test: ## Run web dashboard tests
+	cd web && npm ci && npm run test
+
+.PHONY: web-dev web-build web-lint web-test
 
 fuzz: ## Run fuzz tests locally (60 seconds each)
 	@command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz
