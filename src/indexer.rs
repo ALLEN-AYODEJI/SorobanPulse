@@ -284,6 +284,8 @@ pub struct Indexer<R: RpcClient> {
     kafka_topic: Option<String>,
     #[cfg(feature = "lua")]
     lua_transformer: Option<Arc<crate::lua_transform::LuaTransformer>>,
+    /// Issue #1254: sha256(network passphrase), used to recognise SAC events.
+    sac_network_id: [u8; 32],
 }
 
 impl<R: RpcClient> Indexer<R> {
@@ -293,6 +295,7 @@ impl<R: RpcClient> Indexer<R> {
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
         rpc_client: R,
     ) -> Self {
+        let sac_network_id = crate::sac::network_id(&crate::sac::network_passphrase(&config.chain_id));
         Self {
             pool,
             rpc_client,
@@ -316,6 +319,7 @@ impl<R: RpcClient> Indexer<R> {
             kafka_topic: None,
             #[cfg(feature = "lua")]
             lua_transformer: None,
+            sac_network_id,
         }
     }
 
