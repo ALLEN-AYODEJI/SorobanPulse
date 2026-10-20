@@ -729,14 +729,14 @@ pub fn update_process_memory_bytes() {
 
 /// Spawn a background task that updates process memory every 30 seconds (Linux only).
 #[cfg(target_os = "linux")]
-pub fn spawn_memory_collector() {
+pub fn spawn_memory_collector() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
             update_process_memory_bytes();
         }
-    });
+    })
 }
 
 /// #513: Record notification delivery latency per channel
@@ -1501,6 +1501,13 @@ pub fn record_slo_status_transition(slo: &str, status: &str) {
         "status" => status.to_string()
     )
     .increment(1);
+}
+
+// ── Issue #1248: Background job scheduler ───────────────────────────────────
+
+/// Number of `JobScheduler` jobs that are still running.
+pub fn set_background_jobs_alive(count: usize) {
+    m::gauge!("soroban_pulse_background_jobs_alive").set(count as f64);
 }
 
 // ── Issue #630: Resource utilization metrics ────────────────────────────────

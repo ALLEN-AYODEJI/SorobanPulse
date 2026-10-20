@@ -131,8 +131,12 @@ async fn main() -> anyhow::Result<()> {
     // Initialize metrics exporter
     let prometheus_handle = metrics::init_metrics();
 
+    // Issue #1248: every background task is registered with the scheduler so
+    // it is listed by `GET /v1/admin/jobs` and aborted on shutdown.
+    let jobs = soroban_pulse::job_scheduler::global().clone();
+
     #[cfg(target_os = "linux")]
-    metrics::spawn_memory_collector();
+    jobs.adopt("memory-collector", metrics::spawn_memory_collector());
 
     let config = config::Config::from_env();
 
@@ -340,7 +344,7 @@ async fn main() -> anyhow::Result<()> {
             "Webhook delivery enabled"
         );
 
-        tokio::spawn(async move {
+        jobs.spawn("webhook-delivery", async move {
             let mut rx = webhook_rx;
             loop {
                 match rx.recv().await {
@@ -449,11 +453,11 @@ async fn main() -> anyhow::Result<()> {
                 // SPF deliverability check (Issue #486): warn at startup if the
                 // sending domain has no SPF record. Best-effort and non-blocking.
                 let spf_from = from.clone();
-                tokio::spawn(async move {
+                jobs.spawn_oneshot("email-spf-check", async move {
                     email::verify_spf_record(&spf_from).await;
                 });
 
-                notifier.spawn(email_rx);
+                jobs.adopt("email-notifier", notifier.spawn(email_rx));
             } else {
                 warn!(
                     "EMAIL_SMTP_HOST is set but EMAIL_TO is empty — email notifications disabled"
@@ -492,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
                 "SMS notifications enabled"
             );
 
-            notifier.spawn(sms_rx);
+            jobs.adopt("sms-notifier", notifier.spawn(sms_rx));
         } else {
             warn!("Twilio credentials set but SMS_TO_NUMBERS is empty — SMS notifications disabled");
         }
@@ -501,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
     // Issue #619: Spawn subscription email delivery worker.
     {
         let email_pool = pool.clone();
-        tokio::spawn(subscriptions::run_email_delivery_worker(email_pool));
+        jobs.spawn("subscription-email-delivery", subscriptions::run_email_delivery_worker(email_pool));
     }
 
     // Issue #1162: Encrypt integration credentials at rest with a dedicated key,
@@ -512,7 +516,7 @@ async fn main() -> anyhow::Result<()> {
     );
     {
         let backfill_pool = pool.clone();
-        tokio::spawn(async move {
+        jobs.spawn_oneshot("integration-secrets-backfill", async move {
             if let Err(e) = soroban_pulse::integration_secrets::backfill_plaintext(&backfill_pool).await {
                 error!(error = %e, "Failed to backfill integration credential encryption");
             }
@@ -520,15 +524,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Issue #1057: Auto-fetch contract specs (gated by AUTO_FETCH_CONTRACT_SPECS).
-    tokio::spawn(soroban_pulse::contract_specs::run_worker(pool.clone(), config.stellar_rpc_url.clone()));
+    if soroban_pulse::contract_specs::enabled() {
+        jobs.spawn("contract-specs", soroban_pulse::contract_specs::run_worker(pool.clone(), config.stellar_rpc_url.clone()));
+    }
 
     // Issue #1058: Track contract WASM versions and emit contract_upgraded events.
-    tokio::spawn(soroban_pulse::contract_versions::run_worker(pool.clone(), config.stellar_rpc_url.clone(), event_tx.clone()));
+    jobs.spawn("contract-versions", soroban_pulse::contract_versions::run_worker(pool.clone(), config.stellar_rpc_url.clone(), event_tx.clone()));
 
     // Issue #620: Spawn push notification delivery worker.
     {
         let push_pool = pool.clone();
-        tokio::spawn(push_notification::run_push_delivery_worker(push_pool));
+        jobs.spawn("push-delivery", push_notification::run_push_delivery_worker(push_pool));
     }
 
     // Issue #622: Spawn connection pool monitor.
@@ -539,7 +545,8 @@ async fn main() -> anyhow::Result<()> {
             exhaustion_threshold: 0.9,
             sample_interval: std::time::Duration::from_secs(15),
         };
-        connection_pool::spawn_pool_monitor(pool.clone(), pool_cfg);
+        let (_, handle) = connection_pool::spawn_pool_monitor_with_handle(pool.clone(), pool_cfg);
+        jobs.adopt("pool-monitor", handle);
         connection_pool::log_pool_snapshot(&pool, config.db_max_connections);
     }
 
@@ -553,7 +560,7 @@ async fn main() -> anyhow::Result<()> {
         info!(stream_key = %redis_stream_key, "Redis publisher enabled");
 
         let redis_buffer_max_size = config.redis_buffer_max_size;
-        tokio::spawn(async move {
+        jobs.spawn("redis-publisher", async move {
             queue_publisher::spawn_redis_publisher(
                 redis_url,
                 redis_stream_key,
@@ -699,12 +706,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut secondary_indexer_handles = Vec::new();
-    let indexer_handle = if config.role.runs_indexer() {
+    let mut indexer_job_names = Vec::new();
+    if config.role.runs_indexer() {
         // Spawn the indexer background task.
-        let handle = tokio::spawn(async move {
+        jobs.spawn("indexer", async move {
             indexer.run().await;
         });
+        indexer_job_names.push("indexer".to_string());
 
         // Issue #1063: index additional networks (e.g. testnet alongside
         // mainnet) concurrently from this same deployment. Each additional
@@ -737,14 +745,15 @@ async fn main() -> anyhow::Result<()> {
             network_indexer.set_sse_ring_buffer(std::sync::Arc::clone(&sse_ring_buf));
             network_indexer.set_cost_calculator(cost_calculator.clone());
 
-            let handle = tokio::spawn(async move {
+            let job_name = format!("indexer:{}", target.chain_id);
+            jobs.spawn(job_name.clone(), async move {
                 network_indexer.run().await;
             });
-            secondary_indexer_handles.push(handle);
+            indexer_job_names.push(job_name);
         }
 
         // Spawn index usage monitoring background task (indexer role only)
-        index_monitor::spawn(
+        jobs.adopt("index-monitor", index_monitor::spawn(
             pool.clone(),
             config.index_check_interval_hours,
             shutdown_rx.clone(),
@@ -753,31 +762,31 @@ async fn main() -> anyhow::Result<()> {
                 critical_ratio: config.fragmentation_critical_threshold,
                 auto_reindex: config.fragmentation_auto_reindex,
             },
-        );
+        ));
 
         // Spawn replica sync monitoring background task (#586)
-        replica_monitor::spawn(pool.clone(), 60, shutdown_rx.clone());
+        jobs.adopt("replica-monitor", replica_monitor::spawn(pool.clone(), 60, shutdown_rx.clone()));
 
         // Spawn feature flag rollback watcher (#587)
-        feature_flags::spawn(pool.clone(), 60, shutdown_rx.clone());
+        jobs.adopt("feature-flag-watcher", feature_flags::spawn(pool.clone(), 60, shutdown_rx.clone()));
 
         // Spawn materialized-view refresh background task
-        stats_refresh::spawn(
-            pool.clone(),
-            config.stats_refresh_interval_secs,
-            shutdown_rx.clone(),
+        jobs.adopt(
+            "stats-refresh",
+            stats_refresh::spawn(
+                pool.clone(),
+                config.stats_refresh_interval_secs,
+                shutdown_rx.clone(),
+            ),
         );
-
-        Some(handle)
     } else {
         info!("ROLE=api: indexer and indexer-only background tasks skipped");
         // Drop the un-spawned indexer so its resources are freed.
         drop(indexer);
-        None
-    };
+    }
 
     // Spawn resource metrics collector (all roles — useful on api pods too)
-    resource_metrics::spawn_resource_collector(shutdown_rx.clone());
+    jobs.adopt("resource-metrics", resource_metrics::spawn_resource_collector(shutdown_rx.clone()));
 
     // Issue #1262: Spawn the derived metrics evaluation job. It evaluates each
     // user-defined metric on its configured schedule, publishes the results to
@@ -815,7 +824,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let audit_pool = pool.clone();
         let retention_days = config.notification_audit_log_retention_days;
-        tokio::spawn(notification_admin::purge_old_audit_log_entries(audit_pool, retention_days));
+        jobs.spawn("audit-log-purge", notification_admin::purge_old_audit_log_entries(audit_pool, retention_days));
     }
 
     // #498: Spawn channel health checker
@@ -827,11 +836,14 @@ async fn main() -> anyhow::Result<()> {
             .expect("Failed to build health check HTTP client");
         let interval_secs = config.notification_health_check_interval_secs;
         let health_check_email = config.notification_health_check_email.clone();
-        notification_admin::spawn_channel_health_checker(
-            health_pool,
-            health_client,
-            interval_secs,
-            health_check_email,
+        jobs.adopt(
+            "channel-health-checker",
+            notification_admin::spawn_channel_health_checker(
+                health_pool,
+                health_client,
+                interval_secs,
+                health_check_email,
+            ),
         );
     }
 
@@ -847,11 +859,13 @@ async fn main() -> anyhow::Result<()> {
             // practice this branch only fires if main is re-entered, which
             // does not happen, so we just log and move on.
         }
-        slo_tracker::SloTracker::spawn_evaluator(
-            slo_tracker,
+        if let Some(handle) = slo_tracker::SloTracker::spawn_evaluator(
+            slo_tracker.clone(),
             shutdown_rx.clone(),
             slo_tracker::DEFAULT_EVAL_INTERVAL_SECS,
-        );
+        ) {
+            jobs.adopt("slo-evaluator", handle);
+        }
         info!(
             interval_secs = slo_tracker::DEFAULT_EVAL_INTERVAL_SECS,
             slos_tracked = slo_tracker.definition_count(),
@@ -894,7 +908,7 @@ async fn main() -> anyhow::Result<()> {
         // Wait for SSE connections to drain
         tokio::time::sleep(Duration::from_secs(sse_drain_timeout_secs)).await;
 
-        tokio::spawn(async {
+        soroban_pulse::job_scheduler::global().spawn("shutdown-timeout", async {
             tokio::time::sleep(Duration::from_secs(30)).await;
             tracing::info!("Graceful shutdown timeout reached (30s), forcing exit");
             std::process::exit(0);
@@ -905,9 +919,13 @@ async fn main() -> anyhow::Result<()> {
     let sse_drain_timeout = config.sse_drain_timeout_secs;
     let sse_shutdown_grace_period = config.sse_shutdown_grace_period_ms;
     let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
+    jobs.spawn("shutdown-signal", async move {
         shutdown_signal(event_tx_clone, sse_drain_timeout, sse_shutdown_grace_period, shutdown_tx_clone).await;
     });
+    jobs.spawn(
+        "jobs-metrics",
+        soroban_pulse::job_scheduler::run_metrics_refresher(jobs.clone(), shutdown_rx.clone()),
+    );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     info!(role = ?config.role, addr = %addr, "Binding HTTP server");
@@ -990,13 +1008,14 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    // Wait for the indexer task to finish (only present when role runs indexer).
-    if let Some(handle) = indexer_handle {
-        let _ = handle.await;
+    // Wait for the indexer tasks to finish (only present when role runs indexer),
+    // then abort the remaining background jobs.
+    for name in &indexer_job_names {
+        if let Some(handle) = jobs.take(name) {
+            let _ = handle.await;
+        }
     }
-    for handle in secondary_indexer_handles {
-        let _ = handle.await;
-    }
+    jobs.shutdown_all();
 
     #[cfg(feature = "otel")]
     global::shutdown_tracer_provider();

@@ -237,7 +237,7 @@ pub async fn analyze_query_plans(pool: &PgPool) {
 
 /// Spawn a background task that refreshes the materialized views every `interval_secs` seconds.
 /// Also runs staleness checks and query-plan analysis on each cycle.
-pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<bool>) {
+pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs);
         // Initial refresh on startup
@@ -259,7 +259,7 @@ pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<boo
                 }
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------
