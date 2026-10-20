@@ -109,6 +109,52 @@ class AsyncSorobanPulseClient:
             if not cursor:
                 break
 
+    async def async_events_stream(self, contract_id: Optional[str] = None) -> AsyncIterator[Dict[str, Any]]:
+        """Stream events using Server-Sent Events with automatic reconnection."""
+        if self._session is None:
+            raise RuntimeError("AsyncSorobanPulseClient must be used as an async context manager")
+
+        url = f"{self.base_url}/v1/events/stream"
+        params = {}
+        if contract_id:
+            params["contract_id"] = contract_id
+
+        last_event_id = ""
+        while True:
+            headers = dict(self._headers())
+            if last_event_id:
+                headers["Last-Event-ID"] = last_event_id
+
+            try:
+                async with self._session.stream("GET", url, params=params, headers=headers) as response:
+                    if response.status_code >= 400:
+                        if response.status_code in (401, 403):
+                            raise AuthenticationError("authentication failed")
+                        raise ApiError(response.status_code, "stream failed")
+
+                    async for line in response.aiter_lines():
+                        if not line or line.startswith(":"):
+                            continue
+
+                        if line == ":close":
+                            return
+
+                        if line.startswith("id:"):
+                            last_event_id = line[4:].strip()
+                            continue
+
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                            try:
+                                event = json.loads(data_str)
+                                yield event
+                            except json.JSONDecodeError:
+                                pass
+            except (httpx.RequestError, httpx.HTTPError) as e:
+                raise ApiError(0, f"stream error: {e}") from e
+            except asyncio.CancelledError:
+                return
+
     async def create_subscription(self, contract_id: str, webhook_url: str,
                                    event_types: Optional[List[str]] = None) -> Dict[str, Any]:
         body = {
