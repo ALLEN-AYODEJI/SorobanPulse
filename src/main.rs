@@ -1,6 +1,7 @@
 mod audit_logging;
 mod bloom_filter;
 mod compliance_report;
+mod costs;
 mod compression_config;
 mod config;
 mod dashboard;
@@ -37,7 +38,7 @@ mod models;
 mod normalizer;
 mod notification_dedup;
 
-use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, config_validation, content_filter, cross_chain_correlation, cursor_expiry_handler, db, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, adaptive_pool, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, connection_pool, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, pool_management, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
+use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, config_validation, content_filter, cross_chain_correlation, costs, cursor_expiry_handler, db, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, adaptive_pool, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, connection_pool, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, pool_management, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
 #[cfg(feature = "lua")]
 use soroban_pulse::lua_transform;
 #[cfg(feature = "parquet")]
@@ -63,6 +64,8 @@ mod financial_accuracy;
 mod webhook_template;
 mod event_aggregation;
 mod anomaly_detection;
+mod derived_metrics;
+mod incident_correlation;
 mod push_notification;
 mod connection_pool;
 mod slo_tracker;
@@ -282,6 +285,37 @@ async fn main() -> anyhow::Result<()> {
     // Broadcast channel for real-time SSE streaming (capacity 256 events)
     let (event_tx, _) = tokio::sync::broadcast::channel::<models::SorobanEvent>(256);
 
+    // Issue #1264: Shared operational cost calculator. Wired into the indexer
+    // (RPC + DB costs), webhook delivery and email paths so that every
+    // component records its spend into a single in-memory store. Hourly
+    // snapshots are persisted by the collector spawned further below.
+    let cost_calculator = Arc::new(costs::calculator::CostCalculator::new(
+        costs::calculator::CostRates::from_env(),
+    ));
+
+    // Issue #1266: In-memory idempotency key store with a 24-hour TTL. A
+    // periodic sweeper removes expired entries so the map does not grow
+    // unbounded on long-running pods.
+    let idempotency_store = idempotency::shared_store();
+    {
+        let store = idempotency_store.clone();
+        let mut idem_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let removed = store.remove_expired();
+                        if removed > 0 {
+                            tracing::debug!(removed = removed, "Pruned expired idempotency keys");
+                        }
+                    }
+                    _ = idem_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
     // Spawn webhook delivery task if WEBHOOK_URL is configured.
     if let Some(ref webhook_url) = config.webhook_url {
         let webhook_rx = event_tx.subscribe();
@@ -290,6 +324,7 @@ async fn main() -> anyhow::Result<()> {
         let webhook_contract_filter = config.webhook_contract_filter.clone();
         let webhook_retry_policy = config.webhook_retry_policy.clone();
         let webhook_pool = pool.clone();
+        let webhook_cost_calculator = cost_calculator.clone();
         // Per-channel rate limiter (Issue #476). `None` when no limit configured.
         let webhook_rate_limiter = notification_rate_limit::ChannelRateLimiter::from_config(
             &notification_rate_limit::RateLimitConfig::new(
@@ -330,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
                         let url = webhook_url.clone();
                         let secret = webhook_secret.clone();
                         let pool_ref = Some(pool.as_ref());
+                        let cost_calc = webhook_cost_calculator.clone();
                         let priority = webhook::evaluate_priority(
                             &event,
                             config.notification_priority_rule_path.as_deref(),
@@ -337,16 +373,26 @@ async fn main() -> anyhow::Result<()> {
                             config.notification_priority_rule_priority.as_deref(),
                             &config.notification_default_priority,
                         ).to_string();
-                        // Per-event delivery inside the webhook job, not a long-lived job.
-                        tokio::spawn(webhook::deliver_with_retry_policy(
-                            client,
-                            url,
-                            secret,
-                            event,
-                            pool_ref,
-                            &config.webhook_retry_policy,
-                            priority,
-                        ));
+                        tokio::spawn(async move {
+                            let started = std::time::Instant::now();
+                            webhook::deliver_with_retry_policy(
+                                client,
+                                url,
+                                secret,
+                                event,
+                                pool_ref,
+                                &config.webhook_retry_policy,
+                                priority,
+                            )
+                            .await;
+                            // Issue #1264: record the delivery cost (one unit per
+                            // webhook HTTP call, priced by the configured rate).
+                            cost_calc.record_notification(
+                                costs::calculator::Component::Webhook,
+                                1,
+                                started.elapsed(),
+                            );
+                        });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
@@ -371,7 +417,7 @@ async fn main() -> anyhow::Result<()> {
                     .email_public_base_url
                     .clone()
                     .unwrap_or_else(|| format!("http://localhost:{}", config.port));
-                let notifier = email::EmailNotifier::new(
+                let mut notifier = email::EmailNotifier::new(
                     smtp_host.clone(),
                     config.email_smtp_port,
                     config.email_smtp_user.clone(),
@@ -393,6 +439,8 @@ async fn main() -> anyhow::Result<()> {
                     pool.clone(),
                     base_url,
                 );
+                // Issue #1264: attribute email delivery spend to the cost tracker.
+                notifier.set_cost_calculator(cost_calculator.clone());
 
                 info!(
                     smtp_host = %smtp_host,
@@ -544,6 +592,8 @@ async fn main() -> anyhow::Result<()> {
     indexer.set_indexer_state(indexer_state.clone());
     indexer.set_event_tx(event_tx.clone());
     indexer.set_sse_ring_buffer(std::sync::Arc::clone(&sse_ring_buf));
+    // Issue #1264: track RPC call and DB query costs from the indexer.
+    indexer.set_cost_calculator(cost_calculator.clone());
 
     // Issue #266: Initialize and seed bloom filter
     {
@@ -693,6 +743,7 @@ async fn main() -> anyhow::Result<()> {
             network_indexer.set_indexer_state(indexer_state.clone());
             network_indexer.set_event_tx(event_tx.clone());
             network_indexer.set_sse_ring_buffer(std::sync::Arc::clone(&sse_ring_buf));
+            network_indexer.set_cost_calculator(cost_calculator.clone());
 
             let job_name = format!("indexer:{}", target.chain_id);
             jobs.spawn(job_name.clone(), async move {
@@ -736,6 +787,38 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn resource metrics collector (all roles — useful on api pods too)
     jobs.adopt("resource-metrics", resource_metrics::spawn_resource_collector(shutdown_rx.clone()));
+
+    // Issue #1262: Spawn the derived metrics evaluation job. It evaluates each
+    // user-defined metric on its configured schedule, publishes the results to
+    // the Prometheus registry and persists snapshots for history.
+    {
+        let derived_metrics_config = derived_metrics::DerivedMetricsConfig::from_config(&config);
+        if derived_metrics_config.metrics.is_empty() {
+            info!("No derived metrics configured — derived metrics job not started");
+        } else {
+            info!(
+                count = derived_metrics_config.metrics.len(),
+                "Starting derived metrics evaluation job"
+            );
+            derived_metrics::spawn_evaluation_job(
+                pool.clone(),
+                derived_metrics_config,
+                shutdown_rx.clone(),
+            );
+        }
+    }
+
+    // Issue #1263: Spawn the incident correlation detector loop. It correlates
+    // anomaly alerts, RPC errors and indexer lag into incidents.
+    {
+        let incident_config = incident_correlation::IncidentCorrelationConfig::from_config(&config);
+        info!(
+            window_secs = incident_config.correlation_window_secs,
+            interval_secs = incident_config.evaluation_interval_secs,
+            "Starting incident correlation detector"
+        );
+        incident_correlation::spawn_detector(pool.clone(), incident_config, shutdown_rx.clone());
+    }
 
     // #496: Spawn audit log purge job
     {

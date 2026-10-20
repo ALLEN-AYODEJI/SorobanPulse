@@ -229,6 +229,23 @@ cargo fuzz run fuzz_validate_contract_id
 
 Corpus and crash artifacts are stored under `fuzz/corpus/` and `fuzz/artifacts/` respectively (both git-ignored). The CI pipeline runs fuzz tests for 60 seconds per target on every push and PR, and stores corpus artifacts for 30 days to accumulate interesting inputs over time.
 
+## Benchmarking
+
+Performance benchmarks use Criterion and run automatically on every PR. A regression gate fails CI if any benchmark regresses by more than 15%.
+
+**Benchmark gate policy:**
+- PRs that regress p99 latency by >15% fail CI
+- Baseline is always the latest commit on `main`
+- A comment is posted to the PR with regression details
+
+Run benchmarks locally:
+
+```bash
+cargo bench
+```
+
+The `bench` job in CI is non-blocking for main branch builds, but **blocking** for PRs with a 15% regression threshold.
+
 ## Pre-commit Hooks
 
 This project uses [lefthook](https://github.com/evilmartians/lefthook) to run `cargo check`, `cargo fmt --check`, and `cargo clippy` before every commit.
@@ -247,6 +264,78 @@ lefthook install
 ```
 
 Hooks typically complete in under 30 seconds on a typical change. If a hook fails, fix the reported issue and re-commit.
+
+## Dependency Management
+
+### Automated Dependency Updates
+
+Dependabot runs daily for Cargo, Docker, and GitHub Actions dependencies. Patch-level updates that pass CI are automatically merged without manual review.
+
+**Auto-merge policy:**
+- Patch version bumps (e.g., `1.2.3` → `1.2.4`) merge automatically after CI passes
+- Minor and major updates require manual review
+- All auto-merged PRs must have the `dependencies` label
+
+**Security audits:**
+- `cargo-audit` runs daily at 2 AM UTC
+- New CVEs trigger a Security Advisory issue within 24 hours
+- Issues are tagged with `security`, `automated`, and `priority: critical`
+
+Run security audits locally:
+
+```bash
+cargo install cargo-audit
+cargo audit
+```
+
+## Dependency License Policy
+
+This project is licensed under the [MIT License](LICENSE). All dependencies must
+be compatible with that license.
+
+- **GPL and AGPL licensed dependencies are not permitted.** `cargo-deny` is
+  configured in `deny.toml` to deny these licenses, along with any license not
+  on the allow-list.
+- **Known vulnerabilities and unmaintained crates are denied.** The `advisories`
+  section of `deny.toml` denies `vulnerability` and `unmaintained` advisories
+  from the RustSec database.
+- **CI enforces this.** The `cargo-deny` CI job runs `cargo-deny check` on every
+  push and pull request. A new dependency that introduces a license violation or
+  a known advisory will fail CI and cannot be merged.
+
+Run the check locally before pushing:
+
+```bash
+cargo install cargo-deny   # once
+cargo deny check
+```
+
+### Adding a justified exception
+
+If a dependency genuinely cannot be avoided, add a narrowly scoped exception to
+`deny.toml` rather than disabling the check:
+
+- **License exceptions** go under `licenses.exceptions` with the crate name and
+  the license being allowed, and must include a `reason` explaining why the
+  dependency is required and why the license is acceptable.
+- **Advisory exceptions** go under `advisories.ignore` with the advisory ID and
+  must include a `reason` and a target removal date, so the exception is
+  revisited rather than forgotten.
+
+```toml
+[licenses]
+exceptions = [
+    { name = "example-crate", allow = ["GPL-3.0"], reason = "Build-time only; not distributed" },
+]
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-0000-0000", reason = "Not reachable from our code paths", until = "2026-01-01" },
+]
+```
+
+Exceptions are reviewed like any other code change; expect reviewers to ask
+whether the dependency can be replaced or removed instead.
 
 ## Security: Never Log Sensitive Values
 
@@ -326,6 +415,49 @@ perf(db): add GIN index on event_data JSONB column
 Improves topic filtering query performance by 10x.
 ```
 
+## Issue Lifecycle
+
+Every contribution follows the same path from issue to merge:
+
+1. **Find** an open, unassigned issue — start with
+   [`good first issue`](https://github.com/Soroban-Pulse/SorobanPulse/issues?q=is%3Aissue+is%3Aopen+no%3Aassignee+label%3A%22good+first+issue%22)
+   or [`help wanted`](https://github.com/Soroban-Pulse/SorobanPulse/issues?q=is%3Aissue+is%3Aopen+no%3Aassignee+label%3A%22help+wanted%22).
+2. **Claim** it by commenting (see [Claiming an Issue](#claiming-an-issue)) and wait to be assigned.
+3. **Build** the change on a branch from the latest `main` (see [Contribution Workflow](#contribution-workflow)).
+4. **Open a PR** that follows the [Pull Request rules](#pull-requests).
+5. **Review**: address feedback with new commits; a maintainer or area owner from
+   [MAINTAINERS.md](MAINTAINERS.md) approves.
+6. **Merge**: a maintainer squash-merges once required checks are green; the linked issue closes automatically.
+
+### Claiming an Issue
+
+- Comment on the issue asking to be assigned (e.g. "I'd like to work on this").
+  Do not start work until a maintainer assigns you — unassigned work may collide with someone else's.
+- An issue that already has an assignee is taken. Do not open a competing PR; ask in the issue if you think the claim is abandoned.
+- **New contributors** (no merged PR yet) may hold **at most 2 assigned issues** at a time. Open a PR for one before claiming another.
+- **7-day inactivity release**: if an assigned issue has no activity (comment, linked PR or push) for 7 days,
+  the [Stale Claims](.github/workflows/stale-claims.yml) workflow unassigns it and adds `help wanted`.
+  Post a short progress update to keep a claim alive; issues labelled `pinned` or `priority: critical` are exempt.
+- If you can no longer work on an issue, comment so it can be reassigned.
+
+### Issue Labels
+
+Labels are defined in [`.github/labels.yml`](.github/labels.yml) and synced to the repository by the
+[Sync Labels](.github/workflows/labels.yml) workflow. Add or change labels in that file, not in the GitHub UI.
+
+| Label | Meaning |
+|---|---|
+| `bug`, `enhancement`, `documentation` | Type of change |
+| `good first issue` | Small, well-scoped task with clear acceptance criteria; ideal for a first PR |
+| `help wanted` | Maintainers welcome outside contributions; also applied when a stale claim is released |
+| `difficulty: easy` / `medium` / `hard` | Expected effort and required domain knowledge |
+| `priority: critical` | Production-impacting; reviewed first and exempt from the stale-claim release |
+| `area: indexer`, `area: api`, `area: database`, `area: integrations`, `area: sdk`, `area: frontend`, `area: infra`, `area: docs` | The part of the codebase the issue touches; routes review to the owners in [MAINTAINERS.md](MAINTAINERS.md) |
+| `stale`, `pinned` | Stale-claim workflow state; `pinned` opts an issue out |
+| `security`, `fuzzing`, `automated` | Applied by automation (e.g. the nightly fuzz workflow) |
+
+Every triaged issue should have one type label, one `area:` label and one `difficulty:` label.
+
 ## Contribution Workflow
 
 The preferred contribution path is: open or find an issue, confirm the intended scope, create a branch from the latest `main`, make the smallest complete change, add regression coverage or documentation, run the local checks, and open a pull request. If the change affects API behavior, database schema, deployment, security, or architecture, explain the impact in the issue and link the relevant design or runbook documentation.
@@ -385,10 +517,31 @@ Before requesting review, verify that the change is scoped to the issue, tests c
 
 ## Pull Requests
 
-- Keep PRs focused — one logical change per PR.
-- Ensure `make test` and `make lint` pass locally before opening a PR.
-- Write a clear PR description referencing the relevant issue (e.g. `Closes #75`).
+- **One issue per PR.** Only bundle issues that are tightly related (e.g. the same bug reported twice,
+  or changes that cannot land separately) and explain why in the description. Unrelated bundles will be asked to split.
+- **Link every issue** with `Closes #N` in the PR description — one line per issue — so it closes on merge.
+  Only open a PR for issues you are assigned to.
+- **Required checks** must be green before merge: `Format`, `Clippy`, `cargo-deny`, `Check Migrations`,
+  `sqlx prepare --check` and `Test (rust stable, …)` from [CI](.github/workflows/ci.yml),
+  plus any area-specific workflow your change triggers (e.g. `Dashboard Build`, `Validate SDKs`).
+  Run `make test` and `make lint` locally first.
+- Fill in every section of the [PR template](.github/pull_request_template.md).
 - Use Conventional Commits for all commit messages in the PR.
+- Respond to review feedback within 7 days; PRs left without a response may be closed and the issue released.
+
+### Path-Filtered CI
+
+CI jobs use path filters to reduce wall-clock time. Only jobs relevant to your changes will run:
+
+| Path Changed | Triggered Jobs |
+|--------------|----------------|
+| `src/**`, `tests/**`, `Cargo.*` | Rust tests, clippy, format |
+| `sdk/typescript/**` | TypeScript SDK CI only |
+| `sdk/python/**` | Python SDK CI only |
+| `terraform/**` | Terraform validation only |
+| `migrations/**` | Migration checks only |
+
+The `ci-success` job always runs to keep branch protection requirements stable, even when specific jobs are skipped.
 
 ## Releases
 
