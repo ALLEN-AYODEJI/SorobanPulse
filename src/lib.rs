@@ -76,6 +76,7 @@ pub mod notification_dedup;
 pub mod notification_formatter;
 pub mod pagerduty;
 pub mod pruner;
+pub mod profiling;
 pub mod retention_tiers;
 pub mod pubsub;
 pub mod query_builder;

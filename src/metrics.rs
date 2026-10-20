@@ -164,6 +164,7 @@ pub fn record_indexer_is_leader(is_leader: bool) {
 /// Record an RPC error
 pub fn record_rpc_error() {
     m::counter!("soroban_pulse_rpc_errors_total").increment(1);
+    record_error_by_kind("rpc");
 }
 
 /// Record a validation failure
@@ -318,6 +319,7 @@ pub fn record_notification_failover(channel: &str) {
 /// Record a persistent webhook delivery failure (all retries exhausted)
 pub fn record_webhook_failure() {
     m::counter!("soroban_pulse_webhook_failures_total").increment(1);
+    record_error_by_kind("webhook");
 }
 
 /// Record a PagerDuty delivery failure (all retries exhausted)
@@ -401,6 +403,19 @@ pub fn record_kinesis_throttled() {
 /// Record an email notification failure
 pub fn record_email_failure() {
     m::counter!("soroban_pulse_email_failures_total").increment(1);
+    record_error_by_kind("email");
+}
+
+/// Unified error counter: incremented from each error-generating module
+/// with a kind label (rpc, webhook, email, db, sse)
+pub fn record_error_by_kind(kind: &str) {
+    m::counter!("soroban_pulse_errors_total", "kind" => kind.to_string()).increment(1);
+}
+
+/// Record a partition drop event
+pub fn record_partition_dropped(partition_name: &str) {
+    m::counter!("soroban_pulse_partitions_dropped_total", "partition" => partition_name.to_string())
+        .increment(1);
 }
 
 /// Record an email bounce reported via the bounce webhook (Issue #484)
@@ -574,6 +589,19 @@ pub fn update_sse_connections(count: usize) {
 /// Update the active WebSocket connections count
 pub fn update_ws_connections(count: usize) {
     m::gauge!("soroban_pulse_ws_active_connections").set(count as f64);
+}
+
+/// Record SSE connection event (connected, disconnected, or error)
+pub fn record_sse_connection_event(result: &str) {
+    m::counter!("soroban_pulse_sse_connections_total", "result" => result.to_string()).increment(1);
+    if result == "error" {
+        record_error_by_kind("sse");
+    }
+}
+
+/// Record SSE connection duration (seconds) - duration from connection to disconnection
+pub fn record_sse_connection_duration(duration_secs: f64) {
+    m::histogram!("soroban_pulse_sse_connection_duration_seconds").record(duration_secs);
 }
 
 /// Record timeseries query duration
@@ -1387,6 +1415,7 @@ pub fn record_postgres_health_degraded(response_time_ms: u64) {
 pub fn record_postgres_health_error(response_time_ms: u64) {
     m::counter!("soroban_pulse_postgres_health_checks_total", "status" => "error").increment(1);
     m::histogram!("soroban_pulse_postgres_health_check_duration_ms").record(response_time_ms as f64);
+    record_error_by_kind("db");
 }
 
 /// Record successful RPC health check
