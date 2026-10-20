@@ -115,6 +115,19 @@ cp .env.example .env
 
 Open the newly created `.env` file in your editor and fill in your own real values. Be sure to replace the placeholder credentials (e.g., `<USER>`, `<PASSWORD>`) with your actual database and network details.
 
+For the full list of all environment variables with defaults and descriptions, see **[docs/configuration.md](docs/configuration.md)**.
+
+The table is auto-generated from `src/config.rs` — run `make gen-env-docs` to refresh it.
+
+The most common variables to set are:
+
+| Variable | Description | Default |
+|---|---|---|
+| `DATABASE_URL` | PostgreSQL connection string | required |
+| `STELLAR_RPC_URL` | Soroban RPC endpoint | `https://soroban-testnet.stellar.org` |
+| `PORT` | HTTP server port | `3000` |
+| `API_KEY` | Optional key for API authentication | (disabled) |
+| `RUST_LOG` | Log verbosity level | `info` |
 The essentials:
 
 - `DATABASE_URL` — PostgreSQL connection string (required)

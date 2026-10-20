@@ -229,35 +229,109 @@ impl HealthState {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// @env DATABASE_URL
+    /// @default (required)
+    /// @description PostgreSQL connection string. Also loadable from a file path via DATABASE_URL_FILE.
     pub database_url: String,
-    /// Optional read replica URL. When set, HTTP handlers use this pool; indexer uses primary.
+
+    /// @env DATABASE_REPLICA_URL
+    /// @default (none)
+    /// @description Optional read-replica URL. When set, HTTP handlers use this pool; the indexer uses the primary.
     pub database_replica_url: Option<String>,
+
+    /// @env STELLAR_RPC_URL
+    /// @default https://soroban-testnet.stellar.org
+    /// @description Soroban RPC endpoint. Must be HTTPS unless ALLOW_INSECURE_RPC=true.
     pub stellar_rpc_url: String,
-    /// Optional ordered list of fallback RPC endpoints, tried when the primary
-    /// `stellar_rpc_url` fails. Each is validated with the same rules as the
-    /// primary URL. Set via the comma-separated STELLAR_RPC_FALLBACK_URLS env var.
+
+    /// @env STELLAR_RPC_FALLBACK_URLS
+    /// @default (none)
+    /// @description Comma-separated list of fallback RPC endpoints tried when the primary fails.
     pub stellar_rpc_fallback_urls: Vec<String>,
-    /// Custom headers to inject into every RPC request (name, value). Values are never logged.
+
+    /// @env STELLAR_RPC_HEADERS
+    /// @default (none)
+    /// @description Semicolon-separated "Name: Value" pairs injected into every RPC request. Values are never logged.
     pub rpc_headers: Vec<(String, String)>,
+
+    /// @env START_LEDGER
+    /// @default 0
+    /// @description Ledger sequence to start indexing from. 0 = start from the latest ledger at boot.
     pub start_ledger: u64,
+
+    /// @env START_LEDGER_FALLBACK
+    /// @default false
+    /// @description When true, fall back to the latest ledger if START_LEDGER is no longer available on the RPC.
     pub start_ledger_fallback: bool,
+
+    /// @env PORT
+    /// @default 3000
+    /// @description HTTP server listening port.
     pub port: u16,
+
+    /// @env API_KEY
+    /// @default (disabled)
+    /// @description Optional API key for request authentication. Also accepts API_KEY_SECONDARY for rotation. When unset all requests pass through.
     pub api_keys: Vec<SecretString>,
-    /// Admin API keys, independent of `api_keys`. Required to access
-    /// `/v1/admin/*` endpoints. Set via ADMIN_API_KEY (and optionally
-    /// ADMIN_API_KEY_SECONDARY for rotation). When empty, admin endpoints fall
-    /// back to the regular `api_keys` gate.
+
+    /// @env ADMIN_API_KEY
+    /// @default (disabled)
+    /// @description Key required for /v1/admin/* endpoints, independent of API_KEY. Also accepts ADMIN_API_KEY_SECONDARY. When unset, admin endpoints fall back to API_KEY.
     pub admin_api_keys: Vec<SecretString>,
+
+    /// @env DB_MAX_CONNECTIONS
+    /// @default 10
+    /// @description Maximum number of connections in the PostgreSQL connection pool.
     pub db_max_connections: u32,
+
+    /// @env DB_MIN_CONNECTIONS
+    /// @default 2
+    /// @description Minimum number of idle connections kept open in the PostgreSQL pool.
     pub db_min_connections: u32,
+
+    /// @env DB_IDLE_TIMEOUT_SECS
+    /// @default 600
+    /// @description Seconds before an idle connection is closed and removed from the pool.
     pub db_idle_timeout_secs: u64,
+
+    /// @env DB_MAX_LIFETIME_SECS
+    /// @default 1800
+    /// @description Maximum lifetime in seconds for a pooled database connection.
     pub db_max_lifetime_secs: u64,
+
+    /// @env DB_TEST_BEFORE_ACQUIRE
+    /// @default true
+    /// @description When true, a cheap health-check query is run before returning a connection from the pool.
     pub db_test_before_acquire: bool,
+
+    /// @env BEHIND_PROXY
+    /// @default false
+    /// @description Set to true when running behind a reverse proxy so the real client IP is extracted from X-Forwarded-For.
     pub behind_proxy: bool,
+
+    /// @env RPC_CONNECT_TIMEOUT_SECS
+    /// @default 5
+    /// @description TCP connection timeout in seconds for RPC requests.
     pub rpc_connect_timeout_secs: u64,
+
+    /// @env RPC_REQUEST_TIMEOUT_SECS
+    /// @default 30
+    /// @description Total request timeout in seconds for RPC calls.
     pub rpc_request_timeout_secs: u64,
+
+    /// @env ALLOWED_ORIGINS
+    /// @default *
+    /// @description Comma-separated CORS allowed origins. Wildcard (*) is rejected in production-like environments.
     pub allowed_origins: Vec<String>,
+
+    /// @env RATE_LIMIT_PER_MINUTE
+    /// @default 60
+    /// @description Maximum HTTP requests per IP per minute. Set to 0 to disable rate limiting.
     pub rate_limit_per_minute: u32,
+
+    /// @env INDEXER_LAG_WARN_THRESHOLD
+    /// @default 100
+    /// @description Number of ledgers behind the tip before a warning is emitted.
     /// Per-IP rate limit for `POST /v1/subscriptions` (Issue #1268).
     /// Stricter than the global `rate_limit_per_minute` to prevent DB
     /// connection exhaustion via subscription spam. Set via
@@ -285,35 +359,110 @@ pub struct Config {
     /// disables enforcement (every IP allowed).
     pub ip_allowlist: Vec<String>,
     pub indexer_lag_warn_threshold: u64,
+
+    /// @env INDEXER_STALL_TIMEOUT_SECS
+    /// @default 60
+    /// @description Seconds without a successful indexer poll before the health check reports unhealthy.
     pub indexer_stall_timeout_secs: u64,
+
+    /// @env DB_STATEMENT_TIMEOUT_MS
+    /// @default 5000
+    /// @description PostgreSQL statement timeout in milliseconds applied to every query.
     pub db_statement_timeout_ms: u64,
+
+    /// @env INDEXER_POLL_INTERVAL_MS
+    /// @default 5000
+    /// @description Milliseconds between indexer polls when the chain is caught up. Range: [100, 60000].
     pub indexer_poll_interval_ms: u64,
+
+    /// @env INDEXER_ERROR_BACKOFF_MS
+    /// @default 10000
+    /// @description Milliseconds to wait after an indexer error before retrying. Range: [100, 60000].
     pub indexer_error_backoff_ms: u64,
+
+    /// @env SSE_KEEPALIVE_SECS
+    /// @default 15
+    /// @description SSE keep-alive ping interval in seconds (1–60). Prevents proxies from closing idle streams.
     pub sse_keepalive_interval_ms: u64,
+
+    /// @env SSE_MAX_CONNECTIONS
+    /// @default 1000
+    /// @description Global maximum number of concurrent SSE connections the server will accept.
     pub sse_max_connections: usize,
+
+    /// @env SSE_DRAIN_TIMEOUT_SECS
+    /// @default 5
+    /// @description Seconds to wait for SSE clients to drain before forcefully closing on shutdown. Range: [1, 60].
     pub sse_drain_timeout_secs: u64,
-    /// Maximum number of contract IDs per SSE multi-stream connection (default 100).
+
+    /// @env SSE_MULTI_MAX_CONTRACT_IDS
+    /// @default 100
+    /// @description Maximum number of contract IDs per multiplexed SSE connection.
     pub sse_multi_max_contract_ids: usize,
+
+    /// @env ENVIRONMENT
+    /// @default development
+    /// @description Deployment environment: development, staging, or production. Controls strictness of config validation.
     pub environment: Environment,
+
+    /// @env MAX_BODY_SIZE_BYTES
+    /// @default 1048576
+    /// @description Maximum HTTP request body size in bytes (default 1 MiB).
     pub max_body_size_bytes: usize,
+
+    /// @env LOG_SAMPLE_RATE
+    /// @default 1
+    /// @description Fraction of requests to emit trace-level logs for (1 = all, 10 = every 10th).
     pub log_sample_rate: u32,
+
+    /// @env WEBHOOK_URL
+    /// @default (none)
+    /// @description Target URL for webhook event delivery. When unset, webhook notifications are disabled.
     pub webhook_url: Option<String>,
+
+    /// @env WEBHOOK_SECRET
+    /// @default (none)
+    /// @description HMAC-SHA256 secret used to sign webhook payloads (X-Webhook-Signature header).
     pub webhook_secret: Option<String>,
+
+    /// @env WEBHOOK_CONTRACT_FILTER
+    /// @default (none)
+    /// @description Comma-separated list of contract IDs to deliver via webhook. Empty = deliver all.
     pub webhook_contract_filter: Vec<String>,
-    /// Max webhook notifications per minute for the configured channel (Issue #476).
-    /// `None` disables the per-minute limit.
+
+    /// @env WEBHOOK_RATE_LIMIT_PER_MINUTE
+    /// @default (none)
+    /// @description Maximum webhook notifications per minute. 0 or unset disables the limit.
     pub webhook_rate_limit_per_minute: Option<u32>,
-    /// Max webhook notifications per hour for the configured channel (Issue #476).
-    /// `None` disables the per-hour limit.
+
+    /// @env WEBHOOK_RATE_LIMIT_PER_HOUR
+    /// @default (none)
+    /// @description Maximum webhook notifications per hour. 0 or unset disables the limit.
     pub webhook_rate_limit_per_hour: Option<u32>,
-    /// Require HTTPS for webhook URLs (default: false for development, true for production)
+
+    /// @env WEBHOOK_REQUIRE_HTTPS
+    /// @default false (true in production)
+    /// @description When true, reject webhook URLs that do not use HTTPS. Automatically true in production-like environments.
     pub webhook_require_https: bool,
-    /// Event types to index (empty = all types)
+
+    /// @env INDEXER_EVENT_TYPES
+    /// @default (all types)
+    /// @description Comma-separated list of event types to index: contract, diagnostic, system. Empty = index all.
     pub indexer_event_types: Vec<String>,
-    /// AES-GCM encryption key for event_data (32 bytes, hex-encoded)
+
+    /// @env EVENT_DATA_ENCRYPTION_KEY
+    /// @default (none)
+    /// @description 64-hex-character AES-GCM key (32 bytes) for encrypting event_data at rest. Requires the encryption feature flag.
     pub event_data_encryption_key: Option<[u8; 32]>,
-    /// Previous encryption key for rotation
+
+    /// @env EVENT_DATA_ENCRYPTION_KEY_OLD
+    /// @default (none)
+    /// @description Previous encryption key for zero-downtime key rotation. Requires the encryption feature flag.
     pub event_data_encryption_key_old: Option<[u8; 32]>,
+
+    /// @env INDEX_CHECK_INTERVAL_HOURS
+    /// @default 24
+    /// @description How often (in hours) the index usage monitor runs to report on PostgreSQL index utilisation.
     /// AES-GCM key for integration credentials (Issue #1162), separate from
     /// the event_data key (32 bytes, hex-encoded)
     pub integration_encryption_key: Option<[u8; 32]>,
@@ -321,190 +470,462 @@ pub struct Config {
     pub integration_encryption_key_old: Option<[u8; 32]>,
     /// How often the index usage monitor runs (hours)
     pub index_check_interval_hours: u64,
-    /// Health check timeout in milliseconds
+
+    /// @env HEALTH_CHECK_TIMEOUT_MS
+    /// @default 2000
+    /// @description Timeout in milliseconds for the database ping performed by the health check endpoint.
     pub health_check_timeout_ms: u64,
-    /// TLS certificate file path
+
+    /// @env TLS_CERT_FILE
+    /// @default (none)
+    /// @description Path to the PEM-encoded TLS certificate file for HTTPS termination.
     pub tls_cert_file: Option<String>,
-    /// TLS key file path
+
+    /// @env TLS_KEY_FILE
+    /// @default (none)
+    /// @description Path to the PEM-encoded TLS private key file for HTTPS termination.
     pub tls_key_file: Option<String>,
-    // Issue #266: Bloom filter deduplication
+
+    /// @env BLOOM_FILTER_FP_RATE
+    /// @default 0.001
+    /// @description Target false-positive rate for the bloom filter used in contract existence checks.
     pub bloom_filter_fp_rate: f64,
+
+    /// @env BLOOM_FILTER_CAPACITY
+    /// @default 1000000
+    /// @description Expected maximum number of items in the bloom filter before the FP rate degrades.
     pub bloom_filter_capacity: usize,
-    // Issue #582: Content-fingerprint deduplication across retries
-    /// When true, a SHA-256 fingerprint of each event's content is computed and
-    /// checked against recent DB rows before inserting. Prevents storing
-    /// content-identical events that arrive with a different tx_hash on retry.
+
+    /// @env ENABLE_CONTENT_DEDUP
+    /// @default false
+    /// @description When true, a SHA-256 fingerprint of each event is checked before insert to prevent content-identical duplicates.
     pub enable_content_dedup: bool,
-    /// Lookback window for fingerprint dedup checks (seconds). Default: 3600 (1 hour).
+
+    /// @env DEDUP_WINDOW_SECS
+    /// @default 3600
+    /// @description Lookback window in seconds for content-fingerprint deduplication checks.
     pub dedup_window_secs: u64,
-    // Issue #265: AWS Kinesis streaming
+
+    /// @env KINESIS_STREAM_NAME
+    /// @default (none)
+    /// @description AWS Kinesis stream name for event delivery. Requires the kinesis feature flag.
     pub kinesis_stream_name: Option<String>,
+
+    /// @env AWS_REGION
+    /// @default (none)
+    /// @description AWS region for Kinesis/SQS streaming integrations.
     pub aws_region: Option<String>,
-    // Issue #706: AWS SQS streaming
+
+    /// @env SQS_QUEUE_URL
+    /// @default (none)
+    /// @description AWS SQS queue URL for event delivery. Requires the sqs feature flag.
     pub sqs_queue_url: Option<String>,
+
+    /// @env SQS_DLQ_URL
+    /// @default (none)
+    /// @description AWS SQS dead-letter queue URL for failed event deliveries.
     pub sqs_dlq_url: Option<String>,
+
+    /// @env SQS_BATCH_SIZE
+    /// @default 10
+    /// @description Number of events per SQS SendMessageBatch call (max 10).
     pub sqs_batch_size: usize,
-    // Issue #707: Azure Event Hubs streaming
+
+    /// @env EVENT_HUBS_CONNECTION_STRING
+    /// @default (none)
+    /// @description Azure Event Hubs connection string for event streaming.
     pub event_hubs_connection_string: Option<String>,
+
+    /// @env EVENT_HUB_NAME
+    /// @default (none)
+    /// @description Azure Event Hub name within the namespace.
     pub event_hub_name: Option<String>,
+
+    /// @env EVENT_HUBS_PARTITION_STRATEGY
+    /// @default contract_id
+    /// @description Partition key strategy for Azure Event Hubs: contract_id or round_robin.
     pub event_hubs_partition_strategy: String,
-    // Issue #264: GCP Pub/Sub streaming
+
+    /// @env PUBSUB_PROJECT_ID
+    /// @default (none)
+    /// @description GCP project ID for Pub/Sub event delivery. Requires the pubsub feature flag.
     pub pubsub_project_id: Option<String>,
+
+    /// @env PUBSUB_TOPIC_ID
+    /// @default (none)
+    /// @description GCP Pub/Sub topic ID for event delivery.
     pub pubsub_topic_id: Option<String>,
-    // Issue #398: Pub/Sub message ordering
+
+    /// @env PUBSUB_ENABLE_MESSAGE_ORDERING
+    /// @default true
+    /// @description When true, Pub/Sub messages are published with an ordering key so subscribers receive them in order.
     pub pubsub_enable_message_ordering: bool,
-    /// Maximum allowed size of serialized event_data in bytes.
+
+    /// @env MAX_EVENT_DATA_BYTES
+    /// @default 65536
+    /// @description Maximum allowed size of serialised event_data in bytes (default 64 KiB).
     pub max_event_data_bytes: usize,
-    /// Maximum rows for CSV/JSON export.
+
+    /// @env EXPORT_MAX_ROWS
+    /// @default 10000
+    /// @description Maximum number of rows returned by the CSV/JSON export endpoints.
     pub export_max_rows: u64,
-    /// Maximum number of entries in the contract count cache.
+
+    /// @env CONTRACT_COUNT_CACHE_SIZE
+    /// @default 1000
+    /// @description Maximum number of entries in the per-contract event count cache.
     pub contract_count_cache_size: u64,
-    /// TTL in seconds for contract count cache entries.
+
+    /// @env CONTRACT_COUNT_CACHE_TTL_SECS
+    /// @default 30
+    /// @description TTL in seconds for entries in the per-contract event count cache.
     pub contract_count_cache_ttl_secs: u64,
-    /// How often standby replicas retry the advisory lock (seconds).
+
+    /// @env INDEXER_LOCK_RETRY_SECS
+    /// @default 30
+    /// @description How often standby replicas retry acquiring the advisory lock to become the active indexer.
     pub indexer_lock_retry_secs: u64,
-    /// Enable multi-tenant mode. When true, every API key must be mapped to a
-    /// tenant_id in the api_key_tenants table and all queries are scoped to that
-    /// tenant.  Disabled by default to preserve single-tenant behaviour.
+
+    /// @env MULTI_TENANT
+    /// @default false
+    /// @description When true, every API key is mapped to a tenant_id and all queries are scoped to that tenant.
     pub multi_tenant: bool,
-    /// Per-tenant request rate limit (requests per minute).
-    /// When set and multi_tenant is true, each API key (tenant) gets this quota
-    /// instead of sharing the global RATE_LIMIT_PER_MINUTE pool.
+
+    /// @env TENANT_RATE_LIMIT_PER_MINUTE
+    /// @default (none)
+    /// @description Per-tenant request rate limit (requests per minute). Only effective when MULTI_TENANT=true.
     pub tenant_rate_limit_per_minute: Option<u32>,
-    /// Per-tenant contract filter for the indexer.
-    /// Format: "tenant1:CABC...,CDEF...;tenant2:CXYZ..."
-    /// When set, the indexer only stores events whose contract_id appears in the
-    /// allow-list for the matching tenant.  Empty = index all contracts.
+
+    /// @env TENANT_CONTRACT_FILTER
+    /// @default (none)
+    /// @description Per-tenant contract allow-list. Format: "tenant1:C1,C2;tenant2:C3". Only effective when MULTI_TENANT=true.
     pub tenant_contract_filter: std::collections::HashMap<String, Vec<String>>,
-    /// The tenant_id this indexer instance stamps on every event it inserts.
-    /// Only meaningful when multi_tenant = true.  Set via INDEXER_TENANT_ID env var.
+
+    /// @env INDEXER_TENANT_ID
+    /// @default (none)
+    /// @description The tenant_id stamped on every event this indexer instance inserts. Only meaningful when MULTI_TENANT=true.
     pub indexer_tenant_id: Option<String>,
-    // Email notification fields
+
+    /// @env EMAIL_SMTP_HOST
+    /// @default (none)
+    /// @description SMTP hostname for outbound email notifications. When unset, email notifications are disabled.
     pub email_smtp_host: Option<String>,
+
+    /// @env EMAIL_SMTP_PORT
+    /// @default 587
+    /// @description SMTP port for outbound email (typically 587 for STARTTLS or 465 for implicit TLS).
     pub email_smtp_port: u16,
+
+    /// @env EMAIL_SMTP_USER
+    /// @default (none)
+    /// @description SMTP authentication username.
     pub email_smtp_user: Option<String>,
+
+    /// @env EMAIL_SMTP_PASSWORD
+    /// @default (none)
+    /// @description SMTP authentication password.
     pub email_smtp_password: Option<SecretString>,
+
+    /// @env EMAIL_FROM
+    /// @default (none)
+    /// @description Sender address used in the From header of notification emails.
     pub email_from: Option<String>,
+
+    /// @env EMAIL_TO
+    /// @default (none)
+    /// @description Comma-separated list of recipient addresses for email notifications.
     pub email_to: Vec<String>,
+
+    /// @env EMAIL_CONTRACT_FILTER
+    /// @default (none)
+    /// @description Comma-separated contract IDs to send email notifications for. Empty = notify for all contracts.
     pub email_contract_filter: Vec<String>,
-    /// Public base URL used to build unsubscribe links in emails (Issue #483).
-    /// e.g. `https://pulse.example.com`. When unset, defaults to
-    /// `http://localhost:<PORT>`.
+
+    /// @env EMAIL_PUBLIC_BASE_URL
+    /// @default http://localhost:<PORT>
+    /// @description Public base URL used to build unsubscribe links in notification emails (e.g. https://pulse.example.com).
     pub email_public_base_url: Option<String>,
-    // SMS notification fields (Issue #473)
+
+    /// @env TWILIO_ACCOUNT_SID
+    /// @default (none)
+    /// @description Twilio Account SID for SMS notifications. When unset, SMS notifications are disabled.
     pub twilio_account_sid: Option<String>,
+
+    /// @env TWILIO_AUTH_TOKEN
+    /// @default (none)
+    /// @description Twilio Auth Token for SMS notifications.
     pub twilio_auth_token: Option<SecretString>,
+
+    /// @env TWILIO_FROM_NUMBER
+    /// @default (none)
+    /// @description Twilio sender phone number in E.164 format (e.g. +15551234567).
     pub twilio_from_number: Option<String>,
+
+    /// @env SMS_TO_NUMBERS
+    /// @default (none)
+    /// @description Comma-separated list of E.164 phone numbers to receive SMS notifications.
     pub sms_to_numbers: Vec<String>,
+
+    /// @env SMS_CONTRACT_FILTER
+    /// @default (none)
+    /// @description Comma-separated contract IDs to send SMS notifications for. Empty = notify for all contracts.
     pub sms_contract_filter: Vec<String>,
+
     // Notification retry policies (Issue #474)
     pub webhook_retry_policy: crate::retry_policy::RetryPolicy,
     pub email_retry_policy: crate::retry_policy::RetryPolicy,
     pub sms_retry_policy: crate::retry_policy::RetryPolicy,
-    // Redis stream fields
+
+    /// @env REDIS_URL
+    /// @default (none)
+    /// @description Redis connection URL for event streaming (e.g. redis://localhost:6379). When unset, Redis streaming is disabled.
     pub redis_url: Option<String>,
+
+    /// @env REDIS_STREAM_KEY
+    /// @default (none)
+    /// @description Redis stream key name for event publishing (e.g. soroban:events).
     pub redis_stream_key: Option<String>,
-    /// Maximum number of events to buffer in memory during a Redis outage (default 10 000).
+
+    /// @env REDIS_BUFFER_MAX_SIZE
+    /// @default 10000
+    /// @description Maximum number of events buffered in memory during a Redis outage before dropping.
     pub redis_buffer_max_size: usize,
-    // Stats refresh
+
+    /// @env STATS_REFRESH_INTERVAL_SECS
+    /// @default 3600
+    /// @description How often (in seconds) the background statistics refresh job runs.
     pub stats_refresh_interval_secs: u64,
-    // Issue #327: Event retention and pruning
+
+    /// @env RETENTION_DAYS
+    /// @default 90
+    /// @description Number of days to retain indexed events before they are pruned.
     pub retention_days: u64,
+
+    /// @env PRUNING_INTERVAL_HOURS
+    /// @default 24
+    /// @description How often (in hours) the event pruning job runs to enforce RETENTION_DAYS.
     pub pruning_interval_hours: u64,
-    // Issue #325: SSE Last-Event-ID replay limit
+
+    /// @env SSE_REPLAY_MAX_EVENTS
+    /// @default 1000
+    /// @description Maximum number of past events replayed to a reconnecting SSE client via Last-Event-ID.
     pub sse_replay_limit: u64,
+
+    /// @env SSE_MAX_CONNECTIONS_PER_IP
+    /// @default 10
+    /// @description Maximum concurrent SSE connections allowed per client IP address.
     // Issue #454: SSE_REPLAY_MAX_EVENTS (alias for sse_replay_limit, read from SSE_REPLAY_MAX_EVENTS env var)
     // Issue #453 / #1268: Per-IP SSE connection limit
     pub sse_max_connections_per_ip: usize,
-    // Issue #451: Max lag before disconnect
+
+    /// @env SSE_MAX_LAG_BEFORE_DISCONNECT
+    /// @default 0
+    /// @description Number of events a slow SSE consumer may fall behind before being forcefully disconnected. 0 = disabled.
     pub sse_max_lag_before_disconnect: u64,
-    // Issue #396: Indexer checkpoint persistence
+
+    /// @env INDEXER_IGNORE_CHECKPOINT
+    /// @default false
+    /// @description When true, the indexer ignores any persisted ledger checkpoint and always starts from START_LEDGER.
     pub indexer_ignore_checkpoint: bool,
-    // Issue #426: Maximum events per RPC page
+
+    /// @env RPC_MAX_EVENTS_PER_PAGE
+    /// @default 200
+    /// @description Maximum number of events to request per RPC getEvents page.
     pub rpc_max_events_per_page: usize,
-    /// Maximum ledger range for diff/range queries.
+
+    /// @env MAX_LEDGER_RANGE
+    /// @default 100000
+    /// @description Maximum ledger range allowed for diff/range query endpoints.
     pub max_ledger_range: u64,
-    /// Queries exceeding this duration (ms) are logged at WARN level (issue #421).
+
+    /// @env SLOW_QUERY_THRESHOLD_MS
+    /// @default 1000
+    /// @description Queries exceeding this duration (ms) are logged at WARN level and counted in metrics.
     pub slow_query_threshold_ms: u64,
-    /// Path to Lua event transformation script (lua feature only).
+
+    /// @env EVENT_TRANSFORM_SCRIPT
+    /// @default (none)
+    /// @description Path to a Lua script for transforming events before storage. Requires the lua feature flag.
     pub event_transform_script: Option<String>,
-    /// Execution timeout for Lua scripts in milliseconds (default: 100).
+
+    /// @env EVENT_TRANSFORM_TIMEOUT_MS
+    /// @default 100
+    /// @description Maximum execution time in milliseconds for the Lua event transformation script.
     pub event_transform_timeout_ms: u64,
-    
-    // Webhook notification formatting
+
+    /// @env WEBHOOK_NOTIFICATION_FORMAT
+    /// @default raw
+    /// @description Webhook payload format: raw (full event JSON) or template (rendered via WEBHOOK_MESSAGE_TEMPLATE).
     pub webhook_notification_format: String,
+
+    /// @env WEBHOOK_MESSAGE_TEMPLATE
+    /// @default (none)
+    /// @description Handlebars template string for webhook payload rendering when WEBHOOK_NOTIFICATION_FORMAT=template.
     pub webhook_message_template: Option<String>,
-    
-    // PagerDuty configuration (Issue #472)
+
+    /// @env PAGERDUTY_ROUTING_KEY
+    /// @default (none)
+    /// @description PagerDuty Events API v2 routing key (integration key). When unset, PagerDuty notifications are disabled.
     pub pagerduty_routing_key: Option<String>,
+
+    /// @env PAGERDUTY_SERVICE_NAME
+    /// @default Soroban Pulse
+    /// @description Service name displayed in PagerDuty incidents.
     pub pagerduty_service_name: String,
+
+    /// @env PAGERDUTY_CONTRACT_FILTER
+    /// @default (none)
+    /// @description Comma-separated contract IDs to trigger PagerDuty alerts for. Empty = alert on all contracts.
     pub pagerduty_contract_filter: Vec<String>,
+
+    /// @env PAGERDUTY_EVENT_TYPE_FILTER
+    /// @default (none)
+    /// @description Comma-separated event types to trigger PagerDuty alerts for. Empty = alert on all event types.
     pub pagerduty_event_type_filter: Vec<String>,
+
+    /// @env PAGERDUTY_SEVERITY_MAPPING
+    /// @default {"contract":"error","diagnostic":"warning","system":"info"}
+    /// @description JSON object mapping event types to PagerDuty severity levels (critical, error, warning, info).
     pub pagerduty_severity_mapping: std::collections::HashMap<String, String>,
+
+    /// @env PAGERDUTY_AUTO_RESOLVE
+    /// @default true
+    /// @description When true, PagerDuty incidents are automatically resolved after PAGERDUTY_AUTO_RESOLVE_THRESHOLD_MINUTES.
     pub pagerduty_auto_resolve: bool,
+
+    /// @env PAGERDUTY_AUTO_RESOLVE_THRESHOLD_MINUTES
+    /// @default 30
+    /// @description Minutes of inactivity after which a PagerDuty incident is automatically resolved.
     pub pagerduty_auto_resolve_threshold_minutes: i64,
-    
-    // Stats cache TTL
+
+    /// @env STATS_CACHE_TTL_SECS
+    /// @default 30
+    /// @description TTL in seconds for cached statistics responses.
     pub stats_cache_ttl_secs: u64,
-    /// Grace period (ms) between SSE close-event broadcast and dropping the broadcast sender.
+
+    /// @env SSE_SHUTDOWN_GRACE_PERIOD_MS
+    /// @default 200
+    /// @description Milliseconds between broadcasting the SSE close event and dropping the broadcast sender on shutdown.
     pub sse_shutdown_grace_period_ms: u64,
-    // Email digest grouping by contract (Issue #491)
+
+    /// @env EMAIL_MAX_CONTRACTS_IN_DIGEST
+    /// @default 20
+    /// @description Maximum number of distinct contracts grouped in a single email digest.
     pub email_max_contracts_in_digest: usize,
-    // Notification priority levels (Issue #492)
+
+    /// @env NOTIFICATION_DEFAULT_PRIORITY
+    /// @default medium
+    /// @description Default notification priority level: low, medium, high, or critical.
     pub notification_default_priority: String,
+
+    /// @env NOTIFICATION_PRIORITY_RULE_PATH
+    /// @default (none)
+    /// @description JSONPath expression used to extract a value for priority rule evaluation.
     pub notification_priority_rule_path: Option<String>,
+
+    /// @env NOTIFICATION_PRIORITY_RULE_VALUE
+    /// @default (none)
+    /// @description Value to match against the extracted JSONPath result for priority escalation.
     pub notification_priority_rule_value: Option<String>,
+
+    /// @env NOTIFICATION_PRIORITY_RULE_PRIORITY
+    /// @default (none)
+    /// @description Priority level assigned when the rule matches: low, medium, high, or critical.
     pub notification_priority_rule_priority: Option<String>,
-    // Escalation policy (Issue #493)
+
+    /// @env ESCALATION_PRIMARY_CHANNEL
+    /// @default (none)
+    /// @description Notification channel (webhook, email, sms, pagerduty) to try first before escalating.
     pub escalation_primary_channel: Option<String>,
+
+    /// @env ESCALATION_CHANNEL
+    /// @default (none)
+    /// @description Fallback notification channel to use after ESCALATION_DELAY_MINUTES if the primary channel fails.
     pub escalation_channel: Option<String>,
+
+    /// @env ESCALATION_DELAY_MINUTES
+    /// @default 30
+    /// @description Minutes to wait before escalating a failed notification to the ESCALATION_CHANNEL.
     pub escalation_delay_minutes: u64,
-    // On-call rotation integration (Issue #494)
+
+    /// @env ONCALL_PROVIDER
+    /// @default (none)
+    /// @description On-call rotation provider: pagerduty. When unset, on-call routing is disabled.
     pub oncall_provider: Option<String>,
+
+    /// @env ONCALL_PAGERDUTY_API_KEY
+    /// @default (none)
+    /// @description PagerDuty REST API key used to query on-call schedules.
     pub oncall_pagerduty_api_key: Option<SecretString>,
+
+    /// @env ONCALL_SCHEDULE_ID
+    /// @default (none)
+    /// @description PagerDuty schedule ID to query for the current on-call responder.
     pub oncall_schedule_id: Option<String>,
+
+    /// @env ONCALL_SCHEDULE_CACHE_TTL_SECS
+    /// @default 300
+    /// @description TTL in seconds for the cached on-call schedule lookup result.
     pub oncall_schedule_cache_ttl_secs: u64,
 
-    // Issue #610: Application-level gzip compression for event_data
-    /// When true, event_data is gzip-compressed before writing to event_data_compressed.
+    /// @env EVENT_COMPRESSION_ENABLED
+    /// @default false
+    /// @description When true, event_data is gzip-compressed before writing to the event_data_compressed column.
     pub event_compression_enabled: bool,
-    /// Batch size when migrating existing events to compressed format.
+
+    /// @env EVENT_COMPRESSION_MIGRATION_BATCH_SIZE
+    /// @default 500
+    /// @description Number of events processed per batch when migrating existing events to compressed format.
     pub event_compression_migration_batch_size: i64,
 
-    // Issue #609: Multi-chain support
-    /// The chain_id this indexer instance stamps on indexed events (default "mainnet").
+    /// @env CHAIN_ID
+    /// @default mainnet
+    /// @description Chain identifier stamped on every indexed event (e.g. mainnet, testnet, futurenet).
     pub chain_id: String,
-    /// Comma-separated list of additional network chain_ids to spin up indexer workers for.
+
+    /// @env ADDITIONAL_CHAIN_IDS
+    /// @default (none)
+    /// @description Comma-separated list of additional network chain_ids to spin up parallel indexer workers for.
     pub additional_chain_ids: Vec<String>,
 
-    // Issue #608: Ledger hash tracking
-    /// When true, store ledger hashes and verify continuity on startup.
+    /// @env LEDGER_HASH_TRACKING_ENABLED
+    /// @default false
+    /// @description When true, ledger hashes are stored and chain continuity is verified on startup.
     pub ledger_hash_tracking_enabled: bool,
-    /// Number of ledgers to check during startup hash-chain validation.
+
+    /// @env LEDGER_HASH_VALIDATION_DEPTH
+    /// @default 1000
+    /// @description Number of ledgers to check during startup hash-chain validation.
     pub ledger_hash_validation_depth: u64,
 
-    // Issue #607: Contract ABI caching
-    /// TTL in seconds for the in-process ABI cache (default 86400 = 24 h).
+    /// @env ABI_CACHE_TTL_SECS
+    /// @default 86400
+    /// @description TTL in seconds for in-process contract ABI cache entries (default 24 h).
     pub abi_cache_ttl_secs: u64,
-    /// Maximum number of ABIs kept in the in-process cache.
+
+    /// @env ABI_CACHE_MAX_ENTRIES
+    /// @default 1000
+    /// @description Maximum number of contract ABIs kept in the in-process cache.
     pub abi_cache_max_entries: u64,
 
-    // SSE reconnection ring buffer
-    /// Maximum number of events stored in the in-memory SSE replay ring buffer.
-    /// When full the oldest event is evicted. Default: 10 000.
+    /// @env SSE_RING_BUFFER_CAPACITY
+    /// @default 10000
+    /// @description Maximum number of events stored in the in-memory SSE replay ring buffer. Oldest events are evicted when full.
     pub sse_ring_buffer_capacity: usize,
 
-    // Query result cache (materialized-view backed queries)
-    /// TTL in seconds for cached query results. Clamped to [300, 3600].
+    /// @env QUERY_CACHE_TTL_SECS
+    /// @default 300
+    /// @description TTL in seconds for cached query results. Clamped to [300, 3600].
     pub query_cache_ttl_secs: u64,
-    /// Maximum number of cached query results.
+
+    /// @env QUERY_CACHE_MAX_CAPACITY
+    /// @default 1000
+    /// @description Maximum number of entries in the query result cache.
     pub query_cache_max_capacity: u64,
 
-    // Push preload feature (HTTP/2 Server Push / Link preload headers)
-    /// When true, responses to /v1/events/contract/{contract_id} include
-    /// `Link` preload headers pointing at the contract's schema and ABI
-    /// endpoints, and the /v1/push/* endpoints are enabled.
-    /// Disabled by default. Set ENABLE_PUSH_PRELOAD=true to opt in.
+    /// @env ENABLE_PUSH_PRELOAD
+    /// @default false
+    /// @description When true, responses include HTTP Link preload headers for contract schema/ABI and the /v1/push/* endpoints are enabled.
     pub enable_push_preload: bool,
 
     // Issue #1147: Helm pre-install/pre-upgrade migration Job

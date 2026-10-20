@@ -76,6 +76,12 @@ clean: ## Remove build artifacts
 	cargo clean
 	rm -f openapi.json
 
+gen-env-docs: ## Generate docs/configuration.md from src/config.rs @env tags
+	cargo run --bin gen_env_docs -- --write
+
+check-env-docs: ## Fail if docs/configuration.md is out of sync with src/config.rs
+	cargo run --bin gen_env_docs -- --check
+
 gen-openapi: ## Regenerate openapi.json from handler signatures and sync docs/openapi.json
 	cargo run --bin gen_openapi > openapi.json
 	cp openapi.json docs/openapi.json

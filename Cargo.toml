@@ -114,6 +114,13 @@ mockall = "0.12"
 wiremock = "0.6"
 insta = "1"
 
+[[bin]]
+name = "gen_env_docs"
+path = "src/bin/gen_env_docs.rs"
+
+[[bin]]
+name = "gen_postman"
+path = "src/bin/gen_postman.rs"
 [features]
 default = ["classical-crypto", "dashboard"]
 
