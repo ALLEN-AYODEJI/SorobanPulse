@@ -8,12 +8,12 @@ help: ## Show available targets
 build: ## Compile the project
 	cargo build
 
-test: ## Run the full test suite (requires DATABASE_URL)
-	cargo test
+test: ## Run the full test suite with cargo-nextest (requires DATABASE_URL)
+	cargo nextest run
 
-test-db: ## Start a test Postgres container and run the full test suite
+test-db: ## Start a test Postgres container and run the full test suite with cargo-nextest
 	docker compose -f docker-compose.test.yml up -d --wait
-	DATABASE_URL=postgres://postgres:postgres@localhost/soroban_pulse_test cargo test; \
+	DATABASE_URL=postgres://postgres:postgres@localhost/soroban_pulse_test cargo nextest run; \
 	  EXIT=$$?; \
 	  docker compose -f docker-compose.test.yml down; \
 	  exit $$EXIT

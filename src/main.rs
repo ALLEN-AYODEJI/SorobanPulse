@@ -636,12 +636,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Issue #266: Initialize and seed bloom filter
     {
-        let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(
-            config.bloom_filter_capacity,
-            config.bloom_filter_fp_rate,
-        ));
+        // Determine bloom filter parameters: auto-size if BLOOM_EXPECTED_ITEMS is set, else use configured values
+        let (capacity, fp_rate) = if config.bloom_expected_items > 0 {
+            bloom_filter::auto_size_bloom_filter(config.bloom_expected_items, config.bloom_false_positive_rate)
+        } else {
+            (config.bloom_filter_capacity, config.bloom_filter_fp_rate)
+        };
+
+        let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(capacity, fp_rate));
         match bloom_filter::seed_from_db(&bloom, &pool, 100_000).await {
-            Ok(n) => info!(seeded = n, "Bloom filter seeded from DB"),
+            Ok(n) => info!(seeded = n, capacity = capacity, fp_rate = fp_rate, "Bloom filter seeded from DB"),
             Err(e) => tracing::warn!(error = %e, "Failed to seed bloom filter from DB"),
         }
         indexer.set_bloom_filter(bloom);
