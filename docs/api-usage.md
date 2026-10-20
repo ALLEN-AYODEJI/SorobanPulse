@@ -17,7 +17,8 @@ Substitute your deployed base URL as needed.
 7. [Error handling](#error-handling)
 8. [Server-Sent Events (SSE)](#server-sent-events-sse)
 9. [NDJSON export](#ndjson-export)
-10. [Common curl recipes](#common-curl-recipes)
+10. [Contract resource statistics](#contract-resource-statistics)
+11. [Common curl recipes](#common-curl-recipes)
 
 ---
 
@@ -70,6 +71,59 @@ curl -X POST \
 | Wrong key | `403 Forbidden` |
 | Admin endpoint with regular `API_KEY` | `403 Forbidden` |
 | Correct key | `200 OK` |
+
+### Scoped API keys
+
+For production and multi-tenant deployments, mint per-client keys with
+explicit scopes instead of sharing `API_KEY`. Scoped keys look like
+`sp_<base58>` and are sent the same way as any other key. Only a SHA-256
+hash is stored, so the plaintext is shown **once**, at creation.
+
+| Scope | Grants |
+|---|---|
+| `read:events` | All `GET`/`HEAD` requests (events, contracts, stats, streams) and read-only `POST` queries (`/v1/events/tx/batch`, `/graphql`) |
+| `write:subscriptions` | Creating, updating and deleting subscriptions |
+| `admin` | Everything, including `/v1/admin/*`. Implies every other scope |
+
+Any other mutating request requires `admin`. A key without the scope a route
+needs gets `403 Forbidden` with `{"error": "insufficient scope", "required_scope": "…"}`.
+
+Key management requires `ADMIN_API_KEY` or a key with the `admin` scope —
+even when `ADMIN_API_KEY` is unset, these endpoints never fall open:
+
+```bash
+# Create a key (the response's "key" field is the only time you see it)
+curl -X POST -H "Authorization: Bearer $ADMIN_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"name": "billing-service", "scopes": ["read:events", "write:subscriptions"]}' \
+     http://localhost:3000/v1/admin/api-keys
+
+# List keys (never includes the plaintext key)
+curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:3000/v1/admin/api-keys
+
+# Revoke a key — rejected from the very next request
+curl -X DELETE -H "Authorization: Bearer $ADMIN_API_KEY" \
+     http://localhost:3000/v1/admin/api-keys/$KEY_ID
+```
+
+Scoped keys are checked against the database on every request (no cache), so
+revocation is immediate. `last_used_at` is refreshed at most once a minute.
+In multi-tenant mode, pass `"tenant_id"` when creating a non-admin key to bind
+it to a tenant.
+
+`API_KEY` and `ADMIN_API_KEY` keep working unchanged. If you only use scoped
+keys, set `REQUIRE_API_KEY=true` so requests without a valid key are rejected
+even when `API_KEY` is unset.
+
+### Capability discovery
+
+`GET /v1/meta` is public (no key, no rate limit) and reports the server's
+compiled features, version, build SHA and API version:
+
+```bash
+curl http://localhost:3000/v1/meta
+# {"features":["classical-crypto","dashboard","default"],"version":"1.0.0","build_sha":"076772f1a2b3","api_version":"v1"}
+```
 
 ---
 
@@ -592,6 +646,40 @@ Example output:
 {"id":"uuid1","contract_id":"CABC...","event_type":"contract","ledger":1234567,...}
 {"id":"uuid2","contract_id":"CABC...","event_type":"contract","ledger":1234568,...}
 ```
+
+---
+
+## Contract resource statistics
+
+`GET /v1/contracts/{contract_id}/stats` returns per-contract CPU, memory and
+fee aggregates, computed once per transaction (not per event) and refreshed
+hourly:
+
+```bash
+curl -H "X-Api-Key: $API_KEY" http://localhost:3000/v1/contracts/$CONTRACT_ID/stats
+```
+
+```json
+{
+  "contract_id": "CA3D...",
+  "tx_count": 1520,
+  "first_ledger": 51000120,
+  "last_ledger": 51230044,
+  "resource_fee": { "total": 182400000, "avg": 120000.0, "p50": 98000.0, "p95": 310000.0, "max": 902311 },
+  "cpu_insns":    { "total": 7412000000, "avg": 4876315.8, "p50": 4100000.0, "p95": 9800000.0, "max": 24000000 },
+  "mem_bytes":    { "total": 3200000000, "avg": 2105263.2, "p50": 1900000.0, "p95": 4100000.0, "max": 9000000 },
+  "refreshed_at": "2026-10-17T18:00:00Z"
+}
+```
+
+- `resource_fee` is the charged Soroban resource fee in stroops (the declared
+  fee when the transaction meta does not report it).
+- `cpu_insns` is consumed CPU instructions (the declared limit as a fallback).
+- `mem_bytes` requires an RPC with Soroban diagnostic events enabled; it is
+  `null` otherwise.
+- Returns `404` until resource data exists for the contract. Collection is
+  opt-in on the indexer: set `RESOURCE_STATS_ENABLED=true` (one extra
+  `getTransaction` call per new transaction).
 
 ---
 

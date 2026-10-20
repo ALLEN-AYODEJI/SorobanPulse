@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
-use tracing::{error, info, instrument, span, warn, Level};
+use tracing::{error, info, instrument, span, warn, Instrument, Level};
 
 use crate::{
     bloom_filter::{EventBloomFilter, SessionBloomFilter},
@@ -17,6 +17,7 @@ use crate::{
     metrics,
     models::{GetEventsResult, LatestLedgerResult, RpcResponse, SorobanEvent},
     pubsub::PubSubPublisher,
+    rpc_endpoints::{RpcEndpoints, RpcLatencyProbe},
     xdr_validation,
 };
 
@@ -76,12 +77,10 @@ pub struct SorobanRpcClient {
     client: reqwest::Client,
     /// Custom headers injected into every RPC request. Values are never logged.
     headers: reqwest::header::HeaderMap,
-    /// All candidate URLs: primary at index 0, fallbacks at 1..
-    urls: Vec<String>,
-    /// Index of the currently active URL.
-    active_idx: std::sync::atomic::AtomicUsize,
-    /// Per-URL consecutive error count used for deprioritisation.
-    error_counts: Vec<AtomicU64>,
+    /// Candidate endpoints with latency and health tracking (issue #1256).
+    endpoints: Arc<RpcEndpoints>,
+    /// Endpoint that served the last successful request, for failover metrics.
+    active_idx: AtomicUsize,
 }
 
 impl SorobanRpcClient {
@@ -106,40 +105,109 @@ impl SorobanRpcClient {
 
         let mut urls = vec![config.stellar_rpc_url.clone()];
         urls.extend_from_slice(&config.stellar_rpc_fallback_urls);
-        let n = urls.len();
+        let endpoints = Arc::new(RpcEndpoints::new(urls));
+        metrics::set_rpc_active_endpoint(endpoints.url(0));
 
         Self {
             client,
             headers,
-            urls,
-            active_idx: std::sync::atomic::AtomicUsize::new(0),
-            error_counts: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            endpoints,
+            active_idx: AtomicUsize::new(0),
         }
     }
 
-    /// Return the URL to use next, applying round-robin failover.
-    /// Updates `active_idx` and emits metrics on failover.
-    fn select_url(&self, last_failed_idx: Option<usize>) -> (&str, usize) {
-        let n = self.urls.len();
-        let current = self.active_idx.load(Ordering::Relaxed);
+    /// Background task that measures endpoint latency and revives
+    /// unavailable endpoints. Spawn it alongside the indexer:
+    /// `tokio::spawn(client.latency_probe().run(shutdown_rx))`.
+    pub fn latency_probe(&self) -> RpcLatencyProbe {
+        RpcLatencyProbe::new(
+            self.client.clone(),
+            self.headers.clone(),
+            Arc::clone(&self.endpoints),
+        )
+    }
 
-        if let Some(failed) = last_failed_idx {
-            // Try the next URL after the failed one.
-            let next = (failed + 1) % n;
-            if next != current {
-                self.active_idx.store(next, Ordering::Relaxed);
-                metrics::record_rpc_failover();
-                metrics::set_rpc_active_endpoint(&self.urls[next]);
-                info!(
-                    from = %self.urls[failed],
-                    to = %self.urls[next],
-                    "RPC failover: switching endpoint"
-                );
+    /// Send one JSON-RPC request to `url`.
+    async fn post_once<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &serde_json::Value,
+    ) -> Result<RpcResponse<T>, String> {
+        let response = self
+            .client
+            .post(url)
+            .headers(self.headers.clone())
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    warn!("RPC request timeout");
+                }
+                e.to_string()
+            })?;
+        response.json().await.map_err(|e| e.to_string())
+    }
+
+    /// Send `body` to each endpoint in latency order until one returns a result.
+    ///
+    /// Transport and decoding failures count towards marking an endpoint
+    /// unavailable. A JSON-RPC error object means the endpoint is reachable,
+    /// so it does not, but the next endpoint is still tried; if every
+    /// endpoint fails, that RPC error message is returned in preference to a
+    /// transport error so callers can still recognise e.g. cursor expiry.
+    async fn call_with_failover<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &'static str,
+        body: &serde_json::Value,
+    ) -> Result<T, String> {
+        let mut rpc_err: Option<String> = None;
+        let mut transport_err = String::from("no RPC endpoint reachable");
+
+        for idx in self.endpoints.candidates() {
+            let url = self.endpoints.url(idx).to_owned();
+            let span = span!(
+                Level::INFO,
+                "rpc_call",
+                rpc.method = method,
+                endpoint = %self.endpoints.label(idx)
+            );
+            match self.post_once::<T>(&url, body).instrument(span).await {
+                Ok(RpcResponse { result: Some(r), .. }) => {
+                    self.endpoints.record_success(idx);
+                    let previous = self.active_idx.swap(idx, Ordering::Relaxed);
+                    if previous != idx {
+                        metrics::record_rpc_failover();
+                        metrics::set_rpc_active_endpoint(&url);
+                        info!(
+                            from = %self.endpoints.label(previous),
+                            to = %self.endpoints.label(idx),
+                            "RPC failover: switching endpoint"
+                        );
+                    }
+                    return Ok(r);
+                }
+                Ok(RpcResponse { error, .. }) => {
+                    metrics::record_rpc_error();
+                    let message = match error {
+                        Some(err) => {
+                            warn!(code = err.code, message = %err.message, endpoint = %self.endpoints.label(idx), "RPC error");
+                            err.message
+                        }
+                        None => "RPC returned no result".to_string(),
+                    };
+                    rpc_err.get_or_insert(message);
+                }
+                Err(e) => {
+                    metrics::record_rpc_error();
+                    warn!(endpoint = %self.endpoints.label(idx), error = %e, method, "RPC request failed");
+                    self.endpoints.record_failure(idx);
+                    transport_err = e;
+                }
             }
-            (&self.urls[next], next)
-        } else {
-            (&self.urls[current], current)
         }
+
+        Err(rpc_err.unwrap_or(transport_err))
     }
 }
 
@@ -151,69 +219,9 @@ impl RpcClient for SorobanRpcClient {
             "id": 1,
             "method": "getLatestLedger"
         });
-
-        let mut last_err = String::new();
-        let n = self.urls.len();
-        let start = self.active_idx.load(Ordering::Relaxed);
-
-        for attempt in 0..n {
-            let idx = (start + attempt) % n;
-            let url = self.urls[idx].clone();
-            let span = span!(Level::INFO, "rpc_get_latest_ledger", url = %url);
-            let send_result = {
-                let _enter = span.enter();
-                self.client
-                    .post(&url)
-                    .headers(self.headers.clone())
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() {
-                            warn!("RPC request timeout");
-                        }
-                        metrics::record_rpc_error();
-                        e.to_string()
-                    })
-            };
-
-            match send_result {
-                Err(e) => {
-                    self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                    last_err = e;
-                    self.select_url(Some(idx));
-                    continue;
-                }
-                Ok(response) => {
-                    let resp: RpcResponse<LatestLedgerResult> =
-                        response.json().await.map_err(|e| e.to_string())?;
-                    match resp.result {
-                        Some(r) => {
-                            self.error_counts[idx].store(0, Ordering::Relaxed);
-                            if idx != self.active_idx.load(Ordering::Relaxed) {
-                                self.active_idx.store(idx, Ordering::Relaxed);
-                                metrics::set_rpc_active_endpoint(&url);
-                            }
-                            metrics::update_latest_ledger(r.sequence);
-                            return Ok(r.sequence);
-                        }
-                        None => {
-                            if let Some(err) = resp.error {
-                                warn!(code = err.code, message = %err.message, "RPC error");
-                                metrics::record_rpc_error();
-                                last_err = err.message;
-                            } else {
-                                last_err = "RPC returned no result".to_string();
-                            }
-                            self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                            self.select_url(Some(idx));
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(last_err)
+        let r: LatestLedgerResult = self.call_with_failover("getLatestLedger", &body).await?;
+        metrics::update_latest_ledger(r.sequence);
+        Ok(r.sequence)
     }
 
     async fn get_events(
@@ -247,68 +255,7 @@ impl RpcClient for SorobanRpcClient {
             "method": "getEvents",
             "params": params
         });
-
-        let mut last_err = String::new();
-        let n = self.urls.len();
-        let start = self.active_idx.load(Ordering::Relaxed);
-
-        for attempt in 0..n {
-            let idx = (start + attempt) % n;
-            let url = self.urls[idx].clone(); // clone to avoid holding &self borrow across await
-            let span = span!(Level::INFO, "rpc_get_events", url = %url);
-            let result = {
-                let _enter = span.enter();
-                self.client
-                    .post(&url)
-                    .headers(self.headers.clone())
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() {
-                            warn!("RPC request timeout");
-                        }
-                        metrics::record_rpc_error();
-                        e.to_string()
-                    })
-            };
-
-            match result {
-                Err(e) => {
-                    self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                    last_err = e;
-                    self.select_url(Some(idx));
-                    continue;
-                }
-                Ok(response) => {
-                    let resp: RpcResponse<GetEventsResult> =
-                        response.json().await.map_err(|e| e.to_string())?;
-                    match resp.result {
-                        Some(r) => {
-                            self.error_counts[idx].store(0, Ordering::Relaxed);
-                            if idx != self.active_idx.load(Ordering::Relaxed) {
-                                self.active_idx.store(idx, Ordering::Relaxed);
-                                metrics::set_rpc_active_endpoint(&url);
-                            }
-                            return Ok(r);
-                        }
-                        None => {
-                            if let Some(err) = resp.error {
-                                warn!(code = err.code, message = %err.message, "RPC error");
-                                metrics::record_rpc_error();
-                                last_err = err.message;
-                            } else {
-                                last_err = "RPC returned no result".to_string();
-                            }
-                            self.error_counts[idx].fetch_add(1, Ordering::Relaxed);
-                            self.select_url(Some(idx));
-                        }
-                    }
-                }
-            }
-        }
-
-        Err(last_err)
+        self.call_with_failover("getEvents", &body).await
     }
 }
 

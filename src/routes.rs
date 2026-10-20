@@ -193,6 +193,11 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
         crate::account_events::get_account_events,
         crate::sep41::get_sep41_events,
         handlers::health,
+        crate::meta::get_meta,
+        crate::contract_resource_stats::get_contract_resource_stats,
+        crate::api_keys::create_api_key,
+        crate::api_keys::list_api_keys,
+        crate::api_keys::revoke_api_key,
         handlers::health_live,
         handlers::health_ready,
         handlers::health_postgres,
@@ -289,6 +294,13 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
         crate::models::TimeseriesBucket,
         crate::models::TimeseriesResponse,
         crate::error::ValidationErrorDetail,
+        crate::meta::MetaResponse,
+        crate::contract_resource_stats::ContractResourceStats,
+        crate::contract_resource_stats::ResourceAggregate,
+        crate::api_keys::ApiKeyScope,
+        crate::api_keys::CreateApiKeyRequest,
+        crate::api_keys::CreatedApiKey,
+        crate::api_keys::ApiKeyInfo,
     )),
     tags(
         (name = "events", description = "Event indexing endpoints"),
@@ -427,6 +439,12 @@ pub fn create_router_with_tx_and_tenant_map(
         admin_api_keys: admin_api_keys.clone(),
         tenant_map: Arc::clone(&tenant_map),
         multi_tenant: config.multi_tenant,
+        // Issue #1258: scoped keys are looked up on the primary so a
+        // revocation is never hidden by replica lag.
+        pool: Some(pool.clone()),
+        require_auth: std::env::var("REQUIRE_API_KEY")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false),
     });
     let admin_auth_state = Arc::new(middleware::AdminAuthState { admin_api_keys });
     // Push-preload feature flag state — built early so it can be passed to
@@ -605,6 +623,8 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/events/feed.rss", get(handlers::get_events_feed))
         .route("/events/stats", get(handlers::get_event_stats))
         .route("/contracts/{contract_id}/stats/history", get(handlers::get_contract_stats_history))
+        // Issue #1257: per-contract resource and fee statistics.
+        .route("/contracts/{contract_id}/stats", get(crate::contract_resource_stats::get_contract_resource_stats))
         .route("/events/diff", get(handlers::get_events_diff))
         .route("/events/export", get(handlers::export_events))
         .route("/events/timeseries", get(handlers::get_timeseries))
@@ -782,6 +802,23 @@ pub fn create_router_with_tx_and_tenant_map(
         ));
 
 
+    // Issue #1258: scoped API key management. Always requires an admin
+    // credential, even when ADMIN_API_KEY is unset.
+    let api_key_routes = Router::new()
+        .route(
+            "/admin/api-keys",
+            post(crate::api_keys::create_api_key).get(crate::api_keys::list_api_keys),
+        )
+        .route(
+            "/admin/api-keys/{id}",
+            axum::routing::delete(crate::api_keys::revoke_api_key),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&admin_auth_state),
+            middleware::require_admin_middleware,
+        ));
+    let v1 = v1.merge(api_key_routes);
+
     // Unversioned deprecated aliases (same handlers, add Deprecation header via middleware)
     let deprecated = Router::new()
         .route("/events", get(handlers::get_events))
@@ -811,7 +848,9 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/healthz/rpc", get(handlers::health_rpc))
         .route("/healthz/external/{service}", get(handlers::health_external))
         .route("/unsubscribe", get(handlers::unsubscribe))
-        .route("/metrics", get(handlers::metrics));
+        .route("/metrics", get(handlers::metrics))
+        // Issue #1259: capability discovery — public and never rate-limited.
+        .route("/v1/meta", get(crate::meta::get_meta));
 
     // All other routes — subject to rate limiting.
     let rate_limited_routes = if config.multi_tenant {

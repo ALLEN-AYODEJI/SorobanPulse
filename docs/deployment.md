@@ -430,6 +430,49 @@ For high-volume production deployments, consider a dedicated RPC provider:
 | QuickNode | `https://<endpoint>.stellar.quiknode.pro/<token>/` |
 | Ankr | `https://rpc.ankr.com/stellar_soroban/<token>` |
 
+### Multiple endpoints and automatic failover (`STELLAR_RPC_URLS`)
+
+Configure several RPC endpoints for the same network and the indexer routes
+each request to the fastest healthy one:
+
+```bash
+STELLAR_RPC_URLS=https://rpc-a.example.com,https://rpc-b.example.com/<token>
+```
+
+| Variable | Description |
+| -------- | ----------- |
+| `STELLAR_RPC_URLS` | Comma-separated endpoint list. Takes precedence over `STELLAR_RPC_URL`; the first entry is the primary. |
+| `STELLAR_RPC_URL` | Single endpoint, used when `STELLAR_RPC_URLS` is unset. |
+| `STELLAR_RPC_FALLBACK_URLS` | Extra endpoints appended to either of the above (kept for backward compatibility). |
+
+All endpoints must serve the **same network**. Each entry is validated like
+`STELLAR_RPC_URL`.
+
+How routing works:
+
+- Every **30 s** a background probe times `getLatestLedger` against each
+  endpoint. Requests go to the endpoint with the lowest p50 over its last 10
+  probes; the others are tried in latency order if it fails.
+- An endpoint that fails **3 consecutive** requests or probes is marked
+  unavailable and re-probed every **60 s**. One successful probe returns it to
+  rotation. Unavailable endpoints are still tried as a last resort, so the
+  indexer keeps going if every endpoint is degraded.
+- JSON-RPC error responses (e.g. an expired cursor) mean the endpoint is
+  reachable, so they do not count towards marking it unavailable.
+
+Metrics, labelled by endpoint origin (`scheme://host[:port]`, so tokens in the
+URL path never reach Prometheus):
+
+| Metric | Meaning |
+| ------ | ------- |
+| `soroban_pulse_rpc_endpoint_latency_ms{endpoint}` | p50 probe latency |
+| `soroban_pulse_rpc_endpoint_available{endpoint}` | `1` in rotation, `0` marked unavailable |
+| `soroban_pulse_rpc_failover_total` | Requests served by a different endpoint than the previous one |
+
+Additional networks configured with `ADDITIONAL_CHAIN_IDS` use only their own
+`STELLAR_RPC_URL_<CHAIN_ID>` endpoint; they never fail over to the primary
+network's endpoints.
+
 ### `ALLOW_INSECURE_RPC`
 
 > ⚠️ **Never set this in production.**

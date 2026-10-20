@@ -582,6 +582,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Build and wire up the indexer only when this instance is configured to run it.
     let rpc_client = indexer::SorobanRpcClient::new(&config);
+    // Issue #1256: measures endpoint latency for routing; spawned with the indexer.
+    let rpc_latency_probe = rpc_client.latency_probe();
     let mut indexer = indexer::Indexer::new(
         pool.clone(),
         config.clone(),
@@ -731,8 +733,12 @@ async fn main() -> anyhow::Result<()> {
             let mut network_config = config.clone();
             network_config.chain_id = target.chain_id.clone();
             network_config.stellar_rpc_url = target.rpc_url.clone();
+            // The primary network's fallbacks belong to a different chain;
+            // never route this network's requests to them.
+            network_config.stellar_rpc_fallback_urls = Vec::new();
 
             let network_rpc_client = indexer::SorobanRpcClient::new(&network_config);
+            tokio::spawn(network_rpc_client.latency_probe().run(shutdown_rx.clone()));
             let mut network_indexer = indexer::Indexer::new(
                 pool.clone(),
                 network_config,

@@ -872,6 +872,39 @@ fn parse_rpc_fallback_urls_checked(errors: &mut Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Resolve the RPC endpoint list (issue #1256).
+///
+/// `STELLAR_RPC_URLS` (comma-separated) takes precedence over
+/// `STELLAR_RPC_URL`; its first entry becomes the primary and the rest are
+/// failover candidates. `STELLAR_RPC_FALLBACK_URLS` entries are appended in
+/// either case. Returns `(primary, others)` with duplicates removed.
+fn resolve_rpc_urls_checked(
+    urls_raw: Option<&str>,
+    single_raw: &str,
+    fallbacks: Vec<String>,
+    errors: &mut Vec<String>,
+) -> (String, Vec<String>) {
+    let listed: Vec<String> = urls_raw
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|u| validate_rpc_url_named("STELLAR_RPC_URLS", u, errors))
+        .collect();
+
+    let mut candidates = listed.into_iter();
+    let primary = candidates.next().unwrap_or_else(|| {
+        validate_rpc_url_checked(single_raw, errors).unwrap_or_else(|| single_raw.to_string())
+    });
+    let mut others: Vec<String> = Vec::new();
+    for url in candidates.chain(fallbacks) {
+        if url != primary && !others.contains(&url) {
+            others.push(url);
+        }
+    }
+    (primary, others)
+}
+
 /// Read DATABASE_URL from DATABASE_URL_FILE if set, otherwise fall back to DATABASE_URL.
 fn resolve_database_url_checked(errors: &mut Vec<String>) -> String {
     if let Ok(file_path) = env::var("DATABASE_URL_FILE") {
@@ -1196,16 +1229,19 @@ impl Config {
 
         let database_url = resolve_database_url_checked(&mut errors);
 
-        let stellar_rpc_url = {
-            let raw = env_or_file_or(
-                "STELLAR_RPC_URL",
-                &file,
-                "https://soroban-testnet.stellar.org",
-            );
-            validate_rpc_url_checked(&raw, &mut errors).unwrap_or_else(|| raw.clone())
+        let (stellar_rpc_url, stellar_rpc_fallback_urls) = {
+            let fallbacks = parse_rpc_fallback_urls_checked(&mut errors);
+            resolve_rpc_urls_checked(
+                env_or_file("STELLAR_RPC_URLS", &file).as_deref(),
+                &env_or_file_or(
+                    "STELLAR_RPC_URL",
+                    &file,
+                    "https://soroban-testnet.stellar.org",
+                ),
+                fallbacks,
+                &mut errors,
+            )
         };
-
-        let stellar_rpc_fallback_urls = parse_rpc_fallback_urls_checked(&mut errors);
 
         let db_max_connections = parse_int::<u32>(
             "DB_MAX_CONNECTIONS",
@@ -2304,6 +2340,67 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].contains("STELLAR_RPC_FALLBACK_URLS"));
+    }
+
+    // --- resolve_rpc_urls_checked (issue #1256) ---
+
+    #[test]
+    fn resolve_rpc_urls_uses_single_url_when_list_unset() {
+        let mut errors = Vec::new();
+        let (primary, others) =
+            resolve_rpc_urls_checked(None, "https://rpc1.example.com", vec![], &mut errors);
+        assert_eq!(primary, "https://rpc1.example.com/");
+        assert!(others.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn resolve_rpc_urls_list_takes_precedence() {
+        let mut errors = Vec::new();
+        let (primary, others) = resolve_rpc_urls_checked(
+            Some(" https://a.example.com , https://b.example.com,"),
+            "https://ignored.example.com",
+            vec![],
+            &mut errors,
+        );
+        assert_eq!(primary, "https://a.example.com/");
+        assert_eq!(others, vec!["https://b.example.com/".to_string()]);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn resolve_rpc_urls_appends_fallbacks_without_duplicates() {
+        let mut errors = Vec::new();
+        let (primary, others) = resolve_rpc_urls_checked(
+            Some("https://a.example.com,https://b.example.com"),
+            "https://ignored.example.com",
+            vec![
+                "https://b.example.com/".to_string(),
+                "https://a.example.com/".to_string(),
+                "https://c.example.com/".to_string(),
+            ],
+            &mut errors,
+        );
+        assert_eq!(primary, "https://a.example.com/");
+        assert_eq!(
+            others,
+            vec!["https://b.example.com/".to_string(), "https://c.example.com/".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_rpc_urls_reports_invalid_list_entries() {
+        let mut errors = Vec::new();
+        let (primary, others) = resolve_rpc_urls_checked(
+            Some("ftp://bad.example.com,https://good.example.com"),
+            "https://ignored.example.com",
+            vec![],
+            &mut errors,
+        );
+        assert_eq!(primary, "https://good.example.com/");
+        assert!(others.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("STELLAR_RPC_URLS"));
     }
 
     // --- parse_rpc_headers_checked ---
