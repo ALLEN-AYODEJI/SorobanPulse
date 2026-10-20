@@ -1,9 +1,93 @@
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // The local module is also named `metrics`, which shadows the external crate
 // of the same name. Use an explicit extern-crate alias to disambiguate.
 extern crate metrics as m;
+
+// ── Issue #993: Overflow-safe counter primitives ────────────────────────────
+//
+// Long-running instances accumulate counts in a handful of places using raw
+// `u64`/`AtomicU64` arithmetic (as opposed to the `metrics` crate's own
+// `counter!()` macro, whose internal representation is out of our control).
+// Plain `fetch_add`/`+` wraps silently on overflow, which would make a
+// long-lived counter appear to reset to a small number. `SafeCounter`
+// saturates at `u64::MAX` instead of wrapping, and emits a
+// `soroban_pulse_counter_overflow_total` metric the moment it saturates so
+// the condition is observable rather than silent. See
+// docs/metrics-design.md for the full audit and rationale.
+pub struct SafeCounter {
+    value: AtomicU64,
+    name: &'static str,
+}
+
+impl SafeCounter {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            value: AtomicU64::new(0),
+            name,
+        }
+    }
+
+    /// Increment by `delta` using saturating arithmetic. Returns the new value.
+    /// If the counter has already saturated at `u64::MAX`, records an
+    /// overflow-detection metric instead of wrapping around to a small number.
+    pub fn increment(&self, delta: u64) -> u64 {
+        let mut current = self.value.load(Ordering::Relaxed);
+        loop {
+            let new_value = current.saturating_add(delta);
+            match self.value.compare_exchange_weak(
+                current,
+                new_value,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    if new_value == u64::MAX && current != u64::MAX {
+                        record_counter_overflow_detected(self.name);
+                    }
+                    return new_value;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn get(&self) -> u64 {
+        self.value.load(Ordering::Relaxed)
+    }
+}
+
+impl std::fmt::Debug for SafeCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SafeCounter")
+            .field("name", &self.name)
+            .field("value", &self.get())
+            .finish()
+    }
+}
+
+/// Record that a `SafeCounter` saturated instead of wrapping (issue #993).
+pub fn record_counter_overflow_detected(counter_name: &str) {
+    m::counter!(
+        "soroban_pulse_counter_overflow_total",
+        "counter" => counter_name.to_string()
+    )
+    .increment(1);
+}
+
+/// Publish the current value of a long-running counter as a gauge, so
+/// operators can see counter state (and how close it is to saturating)
+/// without needing to reconstruct it from the exported counter series
+/// (issue #993).
+pub fn record_counter_state(counter_name: &str, value: u64) {
+    m::gauge!(
+        "soroban_pulse_counter_state",
+        "counter" => counter_name.to_string()
+    )
+    .set(value as f64);
+}
 
 /// SLO-aligned histogram buckets for HTTP request duration (seconds).
 const HTTP_DURATION_BUCKETS: &[f64] = &[0.05, 0.1, 0.2, 0.5, 1.0, 5.0];
@@ -137,6 +221,17 @@ pub fn update_reencrypt_progress(remaining: u64) {
     m::gauge!("soroban_pulse_reencrypt_progress").set(remaining as f64);
 }
 
+/// Update the key-rotation progress gauge as a fraction of rows completed
+/// (issue #1270). `rows_total == 0` reports 0.0 rather than NaN.
+pub fn update_reencryption_progress(rows_completed: u64, rows_total: u64) {
+    let ratio = if rows_total == 0 {
+        0.0
+    } else {
+        (rows_completed as f64 / rows_total as f64).clamp(0.0, 1.0)
+    };
+    m::gauge!("soroban_pulse_reencryption_progress").set(ratio);
+}
+
 /// Record a re-encryption error (issue #372)
 pub fn record_reencrypt_error() {
     m::counter!("soroban_pulse_reencrypt_errors_total").increment(1);
@@ -177,6 +272,29 @@ pub fn record_rate_limit_rejected() {
     m::counter!("soroban_pulse_rate_limit_rejected_total").increment(1);
 }
 
+/// Record a subscription registration rejected by the per-IP rate limit
+/// (issue #1268).
+pub fn record_subscription_rate_limited() {
+    m::counter!("soroban_pulse_subscription_rate_limited_total").increment(1);
+}
+
+/// Record an SSE connection rejected by the per-IP connection limit
+/// (issue #1268).
+pub fn record_sse_rate_limited() {
+    m::counter!("soroban_pulse_sse_rate_limited_total").increment(1);
+}
+
+/// Record that a notification was suppressed by a suppression list.
+pub fn record_notification_suppressed() {
+    m::counter!("soroban_pulse_notification_suppressed_total").increment(1);
+}
+
+/// Record a webhook failover event.
+pub fn record_notification_failover(channel: &str) {
+    m::counter!("soroban_pulse_notification_failover_total", "channel" => channel.to_string())
+        .increment(1);
+}
+
 /// Record a persistent webhook delivery failure (all retries exhausted)
 pub fn record_webhook_failure() {
     m::counter!("soroban_pulse_webhook_failures_total").increment(1);
@@ -200,6 +318,11 @@ pub fn record_discord_failure() {
 /// Record a Slack delivery failure (all retries exhausted)
 pub fn record_slack_failure() {
     m::counter!("soroban_pulse_slack_failures_total").increment(1);
+}
+
+/// Record a Microsoft Teams delivery failure (all retries exhausted)
+pub fn record_teams_failure() {
+    m::counter!("soroban_pulse_teams_failures_total").increment(1);
 }
 
 /// Record a Telegram delivery failure (all retries exhausted)
@@ -284,6 +407,35 @@ pub fn record_push_token_invalid() {
     m::counter!("soroban_pulse_push_token_invalid_total").increment(1);
 }
 
+/// Issue #839: Record a push notification delivery retry attempt.
+pub fn record_push_retry(device_type: &str, attempt: u32) {
+    m::counter!(
+        "soroban_pulse_push_retries_total",
+        "device_type" => device_type.to_string(),
+        "attempt" => attempt.to_string()
+    )
+    .increment(1);
+}
+
+/// Issue #839: Record a Web Push notification sent.
+pub fn record_web_push_sent() {
+    m::counter!("soroban_pulse_web_push_sent_total").increment(1);
+}
+
+/// Issue #839: Record a Web Push notification failure.
+pub fn record_web_push_failed() {
+    m::counter!("soroban_pulse_web_push_failed_total").increment(1);
+}
+
+/// Issue #839: Record push notification delivery latency.
+pub fn record_push_delivery_latency(device_type: &str, duration: std::time::Duration) {
+    m::histogram!(
+        "soroban_pulse_push_delivery_latency_seconds",
+        "device_type" => device_type.to_string()
+    )
+    .record(duration.as_secs_f64());
+}
+
 /// Issue #622: Update DB connection pool utilization percentage gauge.
 /// `max_connections` is passed in from config since PgPool does not expose it directly.
 pub fn update_pool_utilization(pool: &PgPool, max_connections: u32) {
@@ -320,7 +472,9 @@ pub fn record_contract_count_cache_invalidation() {
 
 /// Update the contract count cache hit ratio gauge (hits / (hits + misses))
 pub fn update_contract_count_cache_hit_ratio(hits: u64, misses: u64) {
-    let total = hits + misses;
+    // Issue #993: saturating_add avoids a debug-build panic / release-build
+    // wraparound if a long-running instance's hit+miss counts approach u64::MAX.
+    let total = hits.saturating_add(misses);
     let ratio = if total == 0 { 0.0 } else { hits as f64 / total as f64 };
     m::gauge!("soroban_pulse_contract_count_cache_hit_ratio").set(ratio);
 }
@@ -470,6 +624,41 @@ pub fn record_sse_multi_contract_ids(count: u64) {
     m::histogram!("soroban_pulse_sse_multi_contract_ids").record(count as f64);
 }
 
+/// Issue #995: Record connection wait time (time a request spent waiting for a pool slot).
+pub fn record_pool_wait_time(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_db_pool_wait_seconds").record(duration.as_secs_f64());
+}
+
+/// Issue #995: Increment the counter of requests that waited >1 s for a pool connection.
+pub fn record_pool_wait_timeout() {
+    m::counter!("soroban_pulse_db_pool_wait_timeout_total").increment(1);
+}
+
+/// Issue #995: Record the current depth of the connection acquisition queue.
+pub fn update_pool_queue_depth(depth: usize) {
+    m::gauge!("soroban_pulse_db_pool_queue_depth").set(depth as f64);
+}
+
+/// Issue #996: Record a bloom filter reset triggered by memory pressure.
+pub fn record_bloom_filter_memory_reset() {
+    m::counter!("soroban_pulse_bloom_filter_memory_resets_total").increment(1);
+}
+
+/// Issue #996: Update the bloom filter fill ratio (inserted items / capacity).
+pub fn update_bloom_filter_fill_ratio(ratio: f64) {
+    m::gauge!("soroban_pulse_bloom_filter_fill_ratio").set(ratio);
+}
+
+/// Issue #996: Record the estimated memory usage of the bloom filter in bytes.
+pub fn update_bloom_filter_memory_bytes(bytes: u64) {
+    m::gauge!("soroban_pulse_bloom_filter_memory_bytes").set(bytes as f64);
+}
+
+/// Issue #996: Record when the bloom filter was rotated (periodic cleanup cycle).
+pub fn record_bloom_filter_rotation() {
+    m::counter!("soroban_pulse_bloom_filter_rotations_total").increment(1);
+}
+
 /// Record SSE per-IP connection count (histogram, issue #453)
 pub fn record_sse_connections_per_ip(count: usize) {
     m::histogram!("soroban_pulse_sse_connections_per_ip").record(count as f64);
@@ -540,14 +729,14 @@ pub fn update_process_memory_bytes() {
 
 /// Spawn a background task that updates process memory every 30 seconds (Linux only).
 #[cfg(target_os = "linux")]
-pub fn spawn_memory_collector() {
+pub fn spawn_memory_collector() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
         loop {
             interval.tick().await;
             update_process_memory_bytes();
         }
-    });
+    })
 }
 
 /// #513: Record notification delivery latency per channel
@@ -566,6 +755,35 @@ pub fn update_notification_rate_per_minute(channel: &str, rate: f64) {
         "channel" => channel.to_string()
     )
     .set(rate);
+}
+
+/// #695: Record a successful notification delivery attempt.
+pub fn record_notification_delivery_success() {
+    m::counter!("soroban_pulse_notification_delivery_success_total").increment(1);
+}
+
+/// #695: Record a failed notification delivery attempt.
+pub fn record_notification_delivery_failure() {
+    m::counter!("soroban_pulse_notification_delivery_failure_total").increment(1);
+}
+
+/// #695: Record a successful webhook delivery.
+pub fn record_webhook_delivery_success() {
+    m::counter!("soroban_pulse_webhook_delivery_success_total").increment(1);
+}
+
+/// #695: Update the per-contract event count gauge (used for top-10 contract popularity panel).
+pub fn update_contract_event_count(contract_id: &str, count: i64) {
+    m::gauge!(
+        "soroban_pulse_contract_event_count",
+        "contract_id" => contract_id.to_string()
+    )
+    .set(count as f64);
+}
+
+/// #695: Record an observation of indexer lag for heatmap distribution.
+pub fn record_indexer_lag_observation(lag: u64) {
+    m::histogram!("soroban_pulse_indexer_lag_observation_ledgers").record(lag as f64);
 }
 
 // ── Issue #607: Contract ABI cache metrics ───────────────────────────────────
@@ -626,6 +844,17 @@ pub fn update_network_health(chain_id: &str, healthy: bool) {
     .set(if healthy { 1.0 } else { 0.0 });
 }
 
+/// Indexer lag labeled by network (Issue #1063), so each concurrently
+/// indexed network (testnet, mainnet, ...) gets its own lag gauge instead of
+/// sharing the single global `soroban_pulse_indexer_lag_ledgers` metric.
+pub fn update_network_indexer_lag(chain_id: &str, lag: u64) {
+    m::gauge!(
+        "soroban_pulse_network_indexer_lag_ledgers",
+        "chain_id" => chain_id.to_string()
+    )
+    .set(lag as f64);
+}
+
 pub fn update_network_latest_ledger(chain_id: &str, ledger: u64) {
     m::gauge!(
         "soroban_pulse_network_latest_ledger",
@@ -658,6 +887,34 @@ pub fn record_compression_ratio(original_bytes: usize, compressed_bytes: usize) 
 
 pub fn record_decompression_failure() {
     m::counter!("soroban_pulse_decompression_failures_total").increment(1);
+}
+
+// ── Issue #961: HTTP response compression metrics ───────────────────────────
+//
+// Distinct from `record_compression_ratio` above, which tracks storage-level
+// event archival compression. These track the `tower_http::CompressionLayer`
+// middleware that compresses outgoing HTTP responses, so operators can see
+// what fraction of traffic is actually being compressed vs. bypassed (small
+// responses, non-negotiating clients, excluded content types like SSE).
+
+/// Record whether a single HTTP response left the compression layer
+/// compressed (`Content-Encoding` present) or was passed through untouched.
+pub fn record_http_compression_outcome(compressed: bool) {
+    if compressed {
+        m::counter!("soroban_pulse_http_compression_applied_total").increment(1);
+    } else {
+        m::counter!("soroban_pulse_http_compression_bypassed_total").increment(1);
+    }
+}
+
+// ── Issue #962: pagination strategy metrics ─────────────────────────────────
+
+/// Record which pagination strategy a `/v1/events` request used, so
+/// operators can see the offset-vs-cursor adoption split and correlate it
+/// with p99 latency on deep pages.
+pub fn record_pagination_strategy(cursor: bool) {
+    let strategy = if cursor { "cursor" } else { "offset" };
+    m::counter!("soroban_pulse_pagination_requests_total", "strategy" => strategy).increment(1);
 }
 
 // ── SSE ring buffer metrics ──────────────────────────────────────────────────
@@ -733,6 +990,74 @@ pub fn record_streaming_response_error(error_type: &str) {
     .increment(1);
 }
 
+/// Record a chunk flushed to a streaming client, in bytes on the wire.
+pub fn record_streaming_response_chunk(bytes: u64) {
+    m::counter!("soroban_pulse_streaming_response_chunks_total").increment(1);
+    m::histogram!("soroban_pulse_streaming_response_chunk_bytes").record(bytes as f64);
+}
+
+/// Record that a producer parked on a full channel waiting for a slow consumer.
+///
+/// A rising rate here means clients are reading slower than the database
+/// produces — the healthy signal that backpressure is doing its job, and the
+/// early warning that request timeouts are coming.
+pub fn record_streaming_response_backpressure() {
+    m::counter!("soroban_pulse_streaming_response_backpressure_total").increment(1);
+}
+
+/// Record a stream that ended early. `reason` is `caller` or `client`.
+pub fn record_streaming_response_cancelled(reason: &str) {
+    m::counter!(
+        "soroban_pulse_streaming_responses_cancelled_total",
+        "reason" => reason.to_string()
+    )
+    .increment(1);
+}
+
+/// Record total wall time of a streaming response, in seconds.
+pub fn record_streaming_response_duration(seconds: f64) {
+    m::histogram!("soroban_pulse_streaming_response_duration_seconds").record(seconds);
+}
+
+// ── Query Result Streaming metrics (Issue #960) ───────────────────────────────
+
+/// Record a row handed out by a streamed query.
+pub fn record_query_stream_row() {
+    m::counter!("soroban_pulse_query_stream_rows_total").increment(1);
+}
+
+/// Record a completed batch fetch and how many rows it returned.
+pub fn record_query_stream_batch(rows: u64) {
+    m::counter!("soroban_pulse_query_stream_batches_total").increment(1);
+    m::histogram!("soroban_pulse_query_stream_batch_rows").record(rows as f64);
+}
+
+/// Record a failed batch fetch.
+pub fn record_query_stream_error() {
+    m::counter!("soroban_pulse_query_stream_batch_errors_total").increment(1);
+}
+
+/// Record a keep-alive tick emitted while a batch was still running.
+pub fn record_query_stream_keepalive() {
+    m::counter!("soroban_pulse_query_stream_keepalives_total").increment(1);
+}
+
+/// Record a stream stopped by its caller.
+pub fn record_query_stream_cancelled() {
+    m::counter!("soroban_pulse_query_streams_cancelled_total").increment(1);
+}
+
+/// Record a stream that stopped at `max_batches` with rows still unread.
+pub fn record_query_stream_truncated() {
+    m::counter!("soroban_pulse_query_streams_truncated_total").increment(1);
+}
+
+/// Record a stream that delivered its whole result set.
+pub fn record_query_stream_completed(rows: u64) {
+    m::counter!("soroban_pulse_query_streams_completed_total").increment(1);
+    m::histogram!("soroban_pulse_query_stream_rows_per_stream").record(rows as f64);
+}
+
 // ── JSON Serialization metrics (Issue #687) ──────────────────────────────────
 
 /// Record JSON serialization cache hit
@@ -762,7 +1087,68 @@ pub fn record_serialization_time(entity_type: &str, duration_us: u64) {
     .record(duration_us as f64);
 }
 
-// ── PostgreSQL Query Plan Caching metrics (Issue #689) ─────────────────────────
+/// Record an entry evicted from the serialization cache (TTL or capacity). (#959)
+pub fn record_serialization_cache_eviction(entity_type: &str) {
+    m::counter!(
+        "soroban_pulse_serialization_cache_evictions_total",
+        "entity_type" => entity_type.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a deliberate invalidation. `strategy` is `key`, `entity_type`, or `all`. (#959)
+pub fn record_serialization_cache_invalidation(entity_type: &str, strategy: &str) {
+    m::counter!(
+        "soroban_pulse_serialization_cache_invalidations_total",
+        "entity_type" => entity_type.to_string(),
+        "strategy" => strategy.to_string()
+    )
+    .increment(1);
+}
+
+/// Record entries loaded by a pre-warm pass. (#959)
+pub fn record_serialization_cache_prewarm(entity_type: &str, entries: u64) {
+    m::counter!(
+        "soroban_pulse_serialization_cache_prewarmed_total",
+        "entity_type" => entity_type.to_string()
+    )
+    .increment(entries);
+}
+
+/// Record bytes served from cache rather than re-serialized — the CPU the
+/// cache actually saved, as opposed to how often it was consulted. (#959)
+pub fn record_serialization_cache_bytes_saved(entity_type: &str, bytes: u64) {
+    m::counter!(
+        "soroban_pulse_serialization_cache_bytes_saved_total",
+        "entity_type" => entity_type.to_string()
+    )
+    .increment(bytes);
+}
+
+/// Update the live serialization cache entry-count gauge. (#959)
+pub fn update_serialization_cache_entry_count(count: u64) {
+    m::gauge!("soroban_pulse_serialization_cache_entry_count").set(count as f64);
+}
+
+/// Update the observed hit rate, in the range 0.0 to 1.0. (#959)
+pub fn update_serialization_cache_hit_rate(entity_type: &str, rate: f64) {
+    m::gauge!(
+        "soroban_pulse_serialization_cache_hit_rate",
+        "entity_type" => entity_type.to_string()
+    )
+    .set(rate);
+}
+
+/// Update the current cache version, bumped on a bulk invalidation. (#959)
+pub fn update_serialization_cache_version(entity_type: &str, version: u64) {
+    m::gauge!(
+        "soroban_pulse_serialization_cache_version",
+        "entity_type" => entity_type.to_string()
+    )
+    .set(version as f64);
+}
+
+// ── PostgreSQL Query Plan Caching metrics (Issue #689 / #802) ──────────────────
 
 /// Record query plan cache hit
 pub fn record_query_plan_cache_hit() {
@@ -782,6 +1168,37 @@ pub fn record_query_plan_cached() {
 /// Record query planning time in milliseconds
 pub fn record_query_planning_time(planning_time_ms: f64) {
     m::histogram!("soroban_pulse_query_planning_time_ms").record(planning_time_ms);
+}
+
+/// Record a query plan eviction from the LRU/TTL cache. (#802)
+pub fn record_query_plan_cache_eviction() {
+    m::counter!("soroban_pulse_query_plan_cache_evictions_total").increment(1);
+}
+
+/// Update the hit-ratio gauge (0.0 – 1.0).  Refreshed on every get(). (#802)
+pub fn update_query_plan_hit_ratio(ratio: f64) {
+    // Clamp to [0,1] and guard against any NaN that slips through.
+    let safe = if ratio.is_finite() { ratio.clamp(0.0, 1.0) } else { 0.0 };
+    m::gauge!("soroban_pulse_query_plan_cache_hit_ratio").set(safe);
+}
+
+/// Update the live entry-count gauge after each insert. (#802)
+pub fn update_query_plan_cache_entry_count(count: u64) {
+    m::gauge!("soroban_pulse_query_plan_cache_entry_count").set(count as f64);
+}
+
+// ── Schema health metrics (Issue #804) ─────────────────────────────────────
+
+/// Update the count of public-schema indexes whose idx_scan is 0 since the
+/// last statistics reset, excluding newly-created partition indexes. (#804)
+pub fn update_schema_unused_indexes(count: u64) {
+    m::gauge!("soroban_pulse_schema_unused_indexes_total").set(count as f64);
+}
+
+/// Update the count of missing future month partitions for the events table.
+/// A value > 0 means partition pre-creation is lagging. (#804)
+pub fn update_schema_missing_future_partitions(count: u64) {
+    m::gauge!("soroban_pulse_schema_missing_future_partitions").set(count as f64);
 }
 
 // ── Advisory Lock metrics (Issue #686) ────────────────────────────────────────
@@ -840,6 +1257,64 @@ pub fn record_advisory_lock_release_error(lock_id: i64) {
     .increment(1);
 }
 
+// ── Webhook priority queue metrics ─────────────────────────────────────────────
+
+/// Record a priority-queue dequeue with the observed wait time.
+pub fn record_priority_dequeue(priority: &str, wait_ms: u64) {
+    m::counter!(
+        "soroban_pulse_webhook_priority_dequeued_total",
+        "priority" => priority.to_string()
+    )
+    .increment(1);
+    m::histogram!(
+        "soroban_pulse_webhook_priority_wait_ms",
+        "priority" => priority.to_string()
+    )
+    .record(wait_ms as f64);
+}
+
+/// Record a priority SLA violation (task waited longer than its priority allows).
+pub fn record_priority_violation(priority: &str) {
+    m::counter!(
+        "soroban_pulse_webhook_priority_violations_total",
+        "priority" => priority.to_string()
+    )
+    .increment(1);
+}
+
+// ── Webhook signing metrics ────────────────────────────────────────────────────
+
+/// Record a webhook payload signing operation for a given key id.
+pub fn record_webhook_signature_created(key_id: &str) {
+    m::counter!(
+        "soroban_pulse_webhook_signatures_created_total",
+        "key_id" => key_id.to_string()
+    )
+    .increment(1);
+}
+
+/// Record a webhook signature verification result.
+pub fn record_webhook_signature_verified(key_id: &str, success: bool) {
+    m::counter!(
+        "soroban_pulse_webhook_signature_verifications_total",
+        "key_id" => key_id.to_string(),
+        "result" => if success { "success" } else { "failure" }
+    )
+    .increment(1);
+}
+
+// ── HTTP caching metrics ───────────────────────────────────────────────────────
+
+/// Record a conditional-request cache outcome for HTTP caching effectiveness.
+pub fn record_http_cache_result(resource: &str, hit: bool) {
+    m::counter!(
+        "soroban_pulse_http_cache_results_total",
+        "resource" => resource.to_string(),
+        "result" => if hit { "hit" } else { "miss" }
+    )
+    .increment(1);
+}
+
 // ── Health check metrics ──────────────────────────────────────────────────────
 
 /// Record successful PostgreSQL health check
@@ -888,6 +1363,153 @@ pub fn record_batch_config_updated() {
     m::counter!("soroban_pulse_batch_config_updates_total").increment(1);
 }
 
+// ── Issue #885: Conditional Request Handling ────────────────────────────
+
+/// Record a 304 Not Modified response (bandwidth saved).
+pub fn record_conditional_get_304() {
+    m::counter!("soroban_pulse_conditional_get_304_total").increment(1);
+}
+
+/// Record bandwidth savings from conditional GETs.
+pub fn record_conditional_get_bandwidth_saved(bytes: u64) {
+    m::counter!("soroban_pulse_conditional_get_bandwidth_saved_bytes_total").increment(bytes);
+}
+
+/// Record ETag cache hit.
+pub fn record_etag_cache_hit() {
+    m::counter!("soroban_pulse_etag_cache_hits_total").increment(1);
+}
+
+/// Record ETag cache miss.
+pub fn record_etag_cache_miss() {
+    m::counter!("soroban_pulse_etag_cache_misses_total").increment(1);
+}
+
+// ── Issue #884: Subscription Pause/Resume ────────────────────────────────
+
+/// Record subscription pause event.
+pub fn record_subscription_paused() {
+    m::counter!("soroban_pulse_subscriptions_paused_total").increment(1);
+}
+
+/// Record subscription resume event.
+pub fn record_subscription_resumed() {
+    m::counter!("soroban_pulse_subscriptions_resumed_total").increment(1);
+}
+
+/// Record auto-resume of paused subscriptions.
+pub fn record_subscription_auto_resumed(count: u64) {
+    m::counter!("soroban_pulse_subscriptions_auto_resumed_total").increment(count);
+}
+
+// ── Issue #882: Anomaly Detection Alerting ────────────────────────────────
+
+/// Record anomaly detection configuration creation.
+pub fn record_anomaly_detection_configured(count: u64) {
+    m::counter!("soroban_pulse_anomaly_detection_configured_total").increment(count);
+}
+
+/// Record anomaly alerts retrieved.
+pub fn record_anomaly_alerts_queried(count: u64) {
+    m::counter!("soroban_pulse_anomaly_alerts_queried_total").increment(count);
+}
+
+/// Record anomaly alert acknowledged.
+pub fn record_anomaly_alert_acknowledged() {
+    m::counter!("soroban_pulse_anomaly_alerts_acknowledged_total").increment(1);
+}
+
+/// Record anomaly score observation.
+pub fn record_anomaly_score(metric_name: &str, score: f64) {
+    m::histogram!(
+        "soroban_pulse_anomaly_score",
+        "metric" => metric_name.to_string()
+    )
+    .record(score);
+}
+
+/// Record anomaly detection threshold crossing.
+pub fn record_anomaly_threshold_crossed(metric_name: &str, severity: &str) {
+    m::counter!(
+        "soroban_pulse_anomaly_threshold_crossings_total",
+        "metric" => metric_name.to_string(),
+        "severity" => severity.to_string()
+    )
+    .increment(1);
+}
+
+// ── Issue #696: SLI / SLO dashboard metrics ────────────────────────────────
+
+/// Set the rolling SLO completion ratio in `[0.0, 1.0]`.
+///
+/// A value of `1.0` means every sample in the window met the SLO target, while
+/// `0.5` means half met it. Steady values != 1.0 across the window surface as
+/// SLO completion gaps in the Grafana panel.
+pub fn update_slo_completion_ratio(slo: &str, component: &str, ratio: f64) {
+    m::gauge!(
+        "soroban_pulse_slo_completion_ratio",
+        "slo" => slo.to_string(),
+        "component" => component.to_string()
+    )
+    .set(ratio.clamp(0.0, 1.0));
+}
+
+/// Set the fraction of the error budget remaining in `[0.0, 1.0]`.
+///
+/// `1.0` = full budget, `0.0` = exhausted. Values < 0.1 trigger the
+/// `SLOErrorBudgetLow` Prometheus alert defined in `docs/alerts.yml`.
+pub fn update_slo_error_budget_remaining(slo: &str, component: &str, ratio: f64) {
+    m::gauge!(
+        "soroban_pulse_slo_error_budget_remaining",
+        "slo" => slo.to_string(),
+        "component" => component.to_string()
+    )
+    .set(ratio.clamp(0.0, 1.0));
+}
+
+/// Set the SLO burn rate (0 == no consumption; 1 == on track to exhaust budget
+/// exactly at end of window; > 2 == critical).
+pub fn update_slo_burn_rate(slo: &str, component: &str, rate: f64) {
+    let safe = if rate.is_finite() { rate.max(0.0) } else { 100.0 };
+    m::gauge!(
+        "soroban_pulse_slo_burn_rate",
+        "slo" => slo.to_string(),
+        "component" => component.to_string()
+    )
+    .set(safe);
+}
+
+/// Set the most recent SLI observation for an SLO (rendered in the SLI trend
+/// line chart).
+pub fn update_sli_current_value(slo: &str, component: &str, value: f64) {
+    let safe = if value.is_finite() { value } else { 0.0 };
+    m::gauge!(
+        "soroban_pulse_sli_current_value",
+        "slo" => slo.to_string(),
+        "component" => component.to_string()
+    )
+    .set(safe);
+}
+
+/// Record an SLO status transition (Met → AtRisk → Breached). Used by the
+/// Grafana alert panel and the `SLOStatusAtRisk` / `SLOStatusBreached` alert
+/// rules.
+pub fn record_slo_status_transition(slo: &str, status: &str) {
+    m::counter!(
+        "soroban_pulse_slo_evaluation_total",
+        "slo" => slo.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+}
+
+// ── Issue #1248: Background job scheduler ───────────────────────────────────
+
+/// Number of `JobScheduler` jobs that are still running.
+pub fn set_background_jobs_alive(count: usize) {
+    m::gauge!("soroban_pulse_background_jobs_alive").set(count as f64);
+}
+
 // ── Issue #630: Resource utilization metrics ────────────────────────────────
 
 /// Update file descriptor count gauge
@@ -923,6 +1545,227 @@ pub fn update_memory_rss_bytes(bytes: u64) {
 /// Update process memory VMS gauge
 pub fn update_memory_vms_bytes(bytes: u64) {
     m::gauge!("soroban_pulse_process_memory_vms_bytes").set(bytes as f64);
+}
+
+/// Record a successful backup verification (Issue #894)
+pub fn record_backup_verification_success() {
+    m::counter!("soroban_pulse_backup_verification_success_total").increment(1);
+}
+
+/// Record a failed backup verification (Issue #894)
+pub fn record_backup_verification_failure() {
+    m::counter!("soroban_pulse_backup_verification_failure_total").increment(1);
+}
+
+/// Update backup size metrics (Issue #894)
+pub fn update_backup_size_bytes(bytes: u64) {
+    m::gauge!("soroban_pulse_backup_size_bytes").set(bytes as f64);
+}
+
+/// Update backup duration metrics in seconds (Issue #894)
+pub fn update_backup_duration_seconds(duration: f64) {
+    m::gauge!("soroban_pulse_backup_duration_seconds").set(duration);
+}
+
+/// Update restore duration metrics in seconds (Issue #894)
+pub fn update_restore_duration_seconds(duration: f64) {
+    m::gauge!("soroban_pulse_restore_duration_seconds").set(duration);
+}
+
+/// Record backup integrity verification (Issue #894)
+pub fn record_backup_integrity_verified() {
+    m::counter!("soroban_pulse_backup_integrity_verified_total").increment(1);
+}
+
+/// Record backup encryption verification (Issue #894)
+pub fn record_backup_encryption_verified() {
+    m::counter!("soroban_pulse_backup_encryption_verified_total").increment(1);
+}
+
+/// Record backup row count verification (Issue #894)
+pub fn record_backup_row_count_verified() {
+    m::counter!("soroban_pulse_backup_row_count_verified_total").increment(1);
+}
+
+/// Record distributed trace span created (Issue #895)
+pub fn record_trace_span_created(span_name: &str) {
+    m::counter!(
+        "soroban_pulse_trace_spans_created_total",
+        "span_name" => span_name.to_string()
+    )
+    .increment(1);
+}
+
+/// Record trace sampling decision (Issue #895)
+pub fn record_trace_sampled(sampled: bool) {
+    m::counter!(
+        "soroban_pulse_trace_samples_total",
+        "sampled" => if sampled { "true" } else { "false" }
+    )
+    .increment(1);
+}
+
+/// Update trace injection latency (Issue #895)
+pub fn update_trace_injection_latency_ms(latency_ms: f64) {
+    m::gauge!("soroban_pulse_trace_injection_latency_ms").set(latency_ms);
+}
+
+/// Record SLI latency percentile calculation (Issue #896)
+pub fn record_sli_latency_percentile(percentile: &str, value_seconds: f64) {
+    m::gauge!(
+        "soroban_pulse_sli_latency_percentile",
+        "percentile" => percentile.to_string()
+    )
+    .set(value_seconds);
+}
+
+/// Record error rate metric (Issue #896)
+pub fn record_error_rate(endpoint: &str, rate: f64) {
+    m::gauge!(
+        "soroban_pulse_sli_error_rate",
+        "endpoint" => endpoint.to_string()
+    )
+    .set(rate);
+}
+
+/// Record availability metric (Issue #896)
+pub fn record_availability(endpoint: &str, availability: f64) {
+    m::gauge!(
+        "soroban_pulse_sli_availability",
+        "endpoint" => endpoint.to_string()
+    )
+    .set(availability);
+}
+
+/// Record SLO budget burndown (Issue #896)
+pub fn update_slo_budget_burndown(slo: &str, consumed: f64) {
+    m::gauge!(
+        "soroban_pulse_slo_budget_burndown",
+        "slo" => slo.to_string()
+    )
+    .set(consumed);
+}
+
+/// Record alert fired (Issue #897)
+pub fn record_alert_fired(alert_name: &str, severity: &str) {
+    m::counter!(
+        "soroban_pulse_alerts_fired_total",
+        "alert_name" => alert_name.to_string(),
+        "severity" => severity.to_string()
+    )
+    .increment(1);
+}
+
+/// Record alert resolved (Issue #897)
+pub fn record_alert_resolved(alert_name: &str) {
+    m::counter!(
+        "soroban_pulse_alerts_resolved_total",
+        "alert_name" => alert_name.to_string()
+    )
+    .increment(1);
+}
+
+/// Record alert silenced (Issue #897)
+pub fn record_alert_silenced(alert_name: &str, duration_minutes: u64) {
+    m::counter!(
+        "soroban_pulse_alerts_silenced_total",
+        "alert_name" => alert_name.to_string()
+    )
+    .increment(1);
+    m::gauge!(
+        "soroban_pulse_alert_silence_duration_minutes",
+        "alert_name" => alert_name.to_string()
+    )
+    .set(duration_minutes as f64);
+}
+
+/// Update active alert count (Issue #897)
+pub fn update_active_alerts_count(component: &str, count: u64) {
+    m::gauge!(
+        "soroban_pulse_active_alerts",
+        "component" => component.to_string()
+    )
+    .set(count as f64);
+}
+
+// ── Issue #1260: Webhook dead-letter queue metrics ──────────────────────────
+
+/// Update the current depth of the webhook dead-letter queue.
+///
+/// Published on every DLQ insert, delete, and replay so operators can alert on
+/// a growing backlog of webhooks that exhausted all delivery retries.
+pub fn update_webhook_dlq_depth(count: u64) {
+    m::gauge!("soroban_pulse_webhook_dlq_depth").set(count as f64);
+}
+
+// ── Issue #1262: Derived metrics framework ──────────────────────────────────
+
+/// Publish the current value of a user-defined derived metric.
+///
+/// The metric name is `soroban_pulse_derived_<name>` and carries a
+/// `derived=true` label so derived series can be selected independently of
+/// built-in metrics in Prometheus queries.
+pub fn update_derived_metric(name: &str, value: f64) {
+    let safe = if value.is_finite() { value } else { 0.0 };
+    m::gauge!(
+        "soroban_pulse_derived_metric",
+        "name" => name.to_string(),
+        "derived" => "true"
+    )
+    .set(safe);
+}
+
+/// Record how long a single derived metric evaluation took.
+pub fn record_derived_metric_evaluation_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_derived_metrics_evaluation_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a failed derived metric evaluation (query error, evaluator panic, ...).
+pub fn record_derived_metric_evaluation_error() {
+    m::counter!("soroban_pulse_derived_metrics_evaluation_errors_total").increment(1);
+}
+
+/// Record a derived metric definition that failed to parse.
+pub fn record_derived_metric_parse_error() {
+    m::counter!("soroban_pulse_derived_metrics_parse_errors_total").increment(1);
+}
+
+// ── Issue #1263: Incident correlation metrics ───────────────────────────────
+
+/// Record an incident created by the correlation engine.
+pub fn record_incident_created(kind: &str, severity: &str) {
+    m::counter!(
+        "soroban_pulse_incidents_created_total",
+        "kind" => kind.to_string(),
+        "severity" => severity.to_string()
+    )
+    .increment(1);
+}
+
+/// Record an incident resolved (manually or automatically).
+pub fn record_incident_resolved(kind: &str) {
+    m::counter!(
+        "soroban_pulse_incidents_resolved_total",
+        "kind" => kind.to_string()
+    )
+    .increment(1);
+}
+
+/// Update the number of currently open incidents.
+pub fn update_open_incidents(count: u64) {
+    m::gauge!("soroban_pulse_incidents_open").set(count as f64);
+}
+
+/// Record how long a correlation pass took.
+pub fn record_correlation_duration(duration: std::time::Duration) {
+    m::histogram!("soroban_pulse_correlation_duration_seconds")
+        .record(duration.as_secs_f64());
+}
+
+/// Record a detector error encountered while gathering correlation inputs.
+pub fn record_detector_error() {
+    m::counter!("soroban_pulse_detector_errors_total").increment(1);
 }
 
 #[cfg(test)]
@@ -1004,6 +1847,90 @@ mod tests {
 
         // This should not panic
         update_db_pool_metrics(&pool);
+        assert!(true);
+    }
+
+    // ── Issue #695: new custom dashboard panel metrics ───────────────────
+
+    #[test]
+    fn test_record_webhook_delivery_success() {
+        record_webhook_delivery_success();
+        assert!(true);
+    }
+
+    #[test]
+    fn test_record_notification_delivery_success() {
+        record_notification_delivery_success();
+        assert!(true);
+    }
+
+    #[test]
+    fn test_record_notification_delivery_failure() {
+        record_notification_delivery_failure();
+        assert!(true);
+    }
+}
+
+/// Record a successful Prometheus remote write push
+pub fn record_prometheus_remote_write_success() {
+    m::counter!("soroban_pulse_prometheus_remote_write_success_total").increment(1);
+}
+
+/// Record a failed Prometheus remote write push
+pub fn record_prometheus_remote_write_failure() {
+    m::counter!("soroban_pulse_prometheus_remote_write_failures_total").increment(1);
+}
+
+/// Record Prometheus remote write endpoint health check OK
+pub fn record_prometheus_remote_write_health_ok() {
+    m::gauge!("soroban_pulse_prometheus_remote_write_health").set(1.0);
+}
+
+/// Record Prometheus remote write endpoint health check failure
+pub fn record_prometheus_remote_write_health_fail() {
+    m::gauge!("soroban_pulse_prometheus_remote_write_health").set(0.0);
+}
+
+/// Record EventBridge event submission success
+pub fn record_eventbridge_put_events_success(count: u64) {
+    m::counter!("soroban_pulse_eventbridge_put_events_success_total").increment(count);
+}
+
+/// Record EventBridge event submission failure
+pub fn record_eventbridge_put_events_failure() {
+    m::counter!("soroban_pulse_eventbridge_put_events_failures_total").increment(1);
+}
+
+/// Record EventBridge rule creation/update
+pub fn record_eventbridge_rule_created() {
+    m::counter!("soroban_pulse_eventbridge_rules_created_total").increment(1);
+}
+
+/// Record EventBridge rule deletion
+pub fn record_eventbridge_rule_deleted() {
+    m::counter!("soroban_pulse_eventbridge_rules_deleted_total").increment(1);
+}
+
+/// Update EventBridge active rules gauge
+pub fn update_eventbridge_active_rules(count: u64) {
+    m::gauge!("soroban_pulse_eventbridge_active_rules").set(count as f64);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_contract_event_count() {
+        update_contract_event_count("CABCDEF12345678901234567890123456789012345678901234567", 42);
+        update_contract_event_count("CABCDEF12345678901234567890123456789012345678901234567", 0);
+        assert!(true);
+    }
+
+    #[test]
+    fn test_record_indexer_lag_observation() {
+        record_indexer_lag_observation(0);
+        record_indexer_lag_observation(1000);
         assert!(true);
     }
 

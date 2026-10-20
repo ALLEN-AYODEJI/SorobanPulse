@@ -37,3 +37,32 @@ Selector labels
 app.kubernetes.io/name: {{ include "soroban-pulse.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+Create or reference the workload ServiceAccount.
+*/}}
+{{- define "soroban-pulse.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create }}
+{{- default (include "soroban-pulse.fullname" .) .Values.serviceAccount.name }}
+{{- else }}
+{{- default "default" .Values.serviceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
+Selector labels for the api component (split-mode).
+*/}}
+{{- define "soroban-pulse.apiSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "soroban-pulse.name" . }}-api
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: api
+{{- end }}
+
+{{/*
+Selector labels for the indexer component (split-mode).
+*/}}
+{{- define "soroban-pulse.indexerSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "soroban-pulse.name" . }}-indexer
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: indexer
+{{- end }}

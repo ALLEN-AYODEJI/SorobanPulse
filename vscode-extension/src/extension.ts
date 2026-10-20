@@ -2,9 +2,15 @@ import * as vscode from 'vscode';
 import { ApiExplorerProvider, EndpointItem } from './apiExplorer';
 import { RequestTesterPanel } from './requestTester';
 import { ApiEndpoint } from './types';
+import { setApiKey, setAdminApiKey, clearApiKeys, migrateLegacyApiKeys } from './apiKeyManager';
+import { testWebhook } from './webhookTester';
+import { ContractHoverProvider, HOVER_LANGUAGES } from './contractHoverProvider';
 
 export function activate(context: vscode.ExtensionContext): void {
+    void migrateLegacyApiKeys(context);
+
     const explorer = new ApiExplorerProvider();
+    const contractHover = new ContractHoverProvider(context);
 
     // Tree view
     const treeView = vscode.window.createTreeView('sorobanpulse.apiExplorer', {
@@ -27,7 +33,7 @@ export function activate(context: vscode.ExtensionContext): void {
         }),
 
         vscode.commands.registerCommand('sorobanpulse.openRequestTester', (endpoint?: ApiEndpoint) => {
-            RequestTesterPanel.open(context.extensionUri, endpoint);
+            RequestTesterPanel.open(context, endpoint);
         }),
 
         vscode.commands.registerCommand('sorobanpulse.copyUrl', async (item?: EndpointItem) => {
@@ -40,6 +46,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
         vscode.commands.registerCommand('sorobanpulse.openSettings', () => {
             vscode.commands.executeCommand('workbench.action.openSettings', 'sorobanpulse');
+        }),
+
+        // Issue #963: secure API key management (SecretStorage-backed).
+        vscode.commands.registerCommand('sorobanpulse.setApiKey', () => setApiKey(context)),
+        vscode.commands.registerCommand('sorobanpulse.setAdminApiKey', () => setAdminApiKey(context)),
+        vscode.commands.registerCommand('sorobanpulse.clearApiKeys', () => clearApiKeys(context)),
+
+        // Issue #963: webhook test interface.
+        vscode.commands.registerCommand('sorobanpulse.testWebhook', () => testWebhook()),
+
+        // Issue #1125: contract ID hover.
+        vscode.languages.registerHoverProvider(HOVER_LANGUAGES, contractHover),
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('sorobanpulse')) { contractHover.clear(); }
         }),
     );
 }

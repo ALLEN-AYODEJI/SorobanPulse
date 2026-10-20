@@ -358,6 +358,108 @@ curl -X POST https://your-host/v1/admin/lua/preview \
 
 ---
 
+## Replay With Transform Endpoint
+
+Re-run already-indexed events through a Lua transformation and, optionally,
+redeliver the transformed events through the normal downstream pipeline
+(webhooks, SSE, email, etc.) — exactly as if they had just been indexed. This
+is useful for backfilling a new derived field, correcting a past enrichment
+bug, or testing a transformation against real historical data before wiring
+it up as the indexer's permanent `EVENT_TRANSFORM_SCRIPT`.
+
+### `POST /v1/replay/with-transform`
+
+**Request body:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `transformation_script` | string | **Required.** The body of an implicit `function transform_event(event) ... end` — write just the statements, e.g. `"return event"`. Return the (optionally modified) `event` table to keep it, or `nil` to skip it. |
+| `from_ledger` / `to_ledger` | integer | Ledger range to replay. Either this or `from_timestamp` is required. |
+| `from_timestamp` / `to_timestamp` | string (ISO 8601) | Timestamp range to replay, as an alternative to the ledger range. |
+| `contract_id` | string | Restrict replay to a single contract. |
+| `dry_run` | bool | When `true` (default `false`), run the script and report results without redelivering any events. |
+| `limit` | integer | Max events to replay (default 100, max 1000). |
+
+Note the script convention here differs from the `EVENT_TRANSFORM_SCRIPT` file
+and the `/v1/admin/lua/preview` endpoint above, which both require a full
+script that *defines* `transform_event`. This endpoint wraps whatever you
+send as the function body, so short scripts don't need the boilerplate.
+
+**Response:**
+
+```json
+{
+  "replay_id": "8f14e45f-ceea-4c8a-b81e-1234567890ab",
+  "status": "completed",
+  "dry_run": false,
+  "total_events": 3,
+  "transformed_events": 2,
+  "skipped_events": 1,
+  "error_events": 0,
+  "preview": [
+    {
+      "event_id": "11111111-1111-1111-1111-111111111111",
+      "original": { "contractId": "CABC...", "value": { "amount": 100 } },
+      "transformed": { "contractId": "CABC...", "value": { "amount": 100, "amount_xlm": 0.00001 } },
+      "error": null
+    }
+  ]
+}
+```
+
+`status` is `"dry_run"` when the request had `dry_run: true`, otherwise
+`"completed"`. `preview` always lists the original/transformed pair for every
+event considered, regardless of `dry_run`, so you can inspect exactly what
+the script did.
+
+### Examples
+
+Add a human-readable amount alongside the raw stroop value, for the last
+1,000 ledgers, without delivering anything (dry run):
+
+```bash
+curl -X POST https://your-host/v1/replay/with-transform \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_ledger": 100000,
+    "to_ledger": 101000,
+    "dry_run": true,
+    "transformation_script": "if event.value.amount then event.value.amount_xlm = event.value.amount / 10000000 end return event"
+  }'
+```
+
+Backfill a `contract_label` field for one contract and redeliver the
+transformed events to subscribers:
+
+```bash
+curl -X POST https://your-host/v1/replay/with-transform \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_timestamp": "2026-01-01T00:00:00Z",
+    "to_timestamp": "2026-01-02T00:00:00Z",
+    "contract_id": "CABC...",
+    "transformation_script": "event.value.contract_label = \"DEX Contract\" return event"
+  }'
+```
+
+Drop diagnostic events entirely while replaying a ledger range (script
+returns `nil` for events to skip):
+
+```bash
+curl -X POST https://your-host/v1/replay/with-transform \
+  -H "Content-Type: application/json" \
+  -d '{
+    "from_ledger": 50000,
+    "to_ledger": 50500,
+    "transformation_script": "if event.event_type == \"diagnostic\" then return nil end return event"
+  }'
+```
+
+See `examples/replay_with_transform_normalize.lua` for a longer example in
+the same bare-body convention.
+
+---
+
 ## Future Enhancements
 
 Potential future improvements:

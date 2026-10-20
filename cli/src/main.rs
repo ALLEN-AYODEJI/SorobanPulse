@@ -3,9 +3,12 @@ mod config;
 mod exporter;
 mod formatter;
 mod query;
+mod subscription;
+mod tail;
+mod webhook_test;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
 
@@ -21,9 +24,12 @@ use query::{
 // CLI definition
 // ---------------------------------------------------------------------------
 
+/// `spulse --version` output: crate version plus the git commit it was built from.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("SPULSE_GIT_SHA"), ")");
+
 /// spulse — query and analyze Soroban Pulse events from the command line.
 #[derive(Parser)]
-#[command(name = "spulse", version, about, long_about = None)]
+#[command(name = "spulse", version = VERSION, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
     /// Soroban Pulse base URL (overrides config)
@@ -137,6 +143,87 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Manage event subscriptions
+    Subscriptions {
+        #[command(subcommand)]
+        action: SubscriptionAction,
+    },
+
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
+    Completions {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
+
+    /// Stream live events as NDJSON (one JSON object per line)
+    Tail {
+        /// Contract ID to stream events for
+        #[arg(long, short = 'c')]
+        contract: String,
+        /// Filter: event type (contract, diagnostic, system)
+        #[arg(long = "type", short = 't')]
+        event_type: Option<String>,
+    },
+
+    /// Send a synthetic test event to a webhook URL and report the result
+    WebhookTest {
+        /// Callback URL to POST the test payload to
+        url: String,
+        /// Contract ID to embed in the sample event
+        #[arg(long, default_value = "CTESTCONTRACTID0000000000000000000000000000000000000")]
+        contract: String,
+        /// Seconds to wait for a response before timing out
+        #[arg(long, default_value_t = 10)]
+        timeout: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum SubscriptionAction {
+    /// Create a new subscription
+    Create {
+        /// URL events will be delivered to
+        #[arg(long)]
+        callback_url: String,
+        /// Ledger sequence to start streaming from
+        #[arg(long)]
+        from_ledger: i64,
+        /// Delivery mode (e.g. "immediate", "batch")
+        #[arg(long)]
+        subscription_type: Option<String>,
+        /// Events per batch (batch mode only)
+        #[arg(long)]
+        batch_size: Option<i32>,
+        /// Max time to wait before flushing a partial batch, in ms
+        #[arg(long)]
+        batch_timeout_ms: Option<i32>,
+    },
+    /// Fetch a subscription by id
+    Get { id: String },
+    /// Cancel and delete a subscription
+    Delete { id: String },
+    /// Acknowledge delivery up to a ledger, advancing the subscription cursor
+    Ack {
+        id: String,
+        #[arg(long)]
+        ledger: i64,
+    },
+    /// Pause delivery without deleting the subscription
+    Pause {
+        id: String,
+        /// Pause duration in seconds (omit to pause indefinitely)
+        #[arg(long)]
+        seconds: Option<i64>,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Resume a paused subscription
+    Resume {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -171,6 +258,12 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Completions need no config, so a broken config file cannot break them.
+    if let Commands::Completions { shell } = cli.command {
+        clap_complete::generate(shell, &mut Cli::command(), "spulse", &mut std::io::stdout());
+        return Ok(());
+    }
 
     // Load config and apply CLI overrides
     let mut cfg = Config::load()?;
@@ -260,9 +353,62 @@ fn run() -> Result<()> {
             println!("{} {} record(s) → {}", "Exported".green().bold(), n, output.display());
         }
 
+        Commands::Completions { .. } => unreachable!("handled before loading config"),
+
         Commands::Config { action } => handle_config(action)?,
+
+        Commands::Subscriptions { action } => handle_subscription(&cfg, action)?,
+
+        Commands::Tail { contract, event_type } => {
+            let client = ApiClient::new(&cfg)?;
+            tail::run(&client, &contract, event_type.as_deref())?;
+        }
+
+        Commands::WebhookTest { url, contract, timeout } => {
+            let result = webhook_test::send(&url, &contract, timeout)?;
+            webhook_test::print_result(&url, &result);
+            if !(200..300).contains(&result.status) {
+                std::process::exit(1);
+            }
+        }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions subcommand handler
+// ---------------------------------------------------------------------------
+
+fn handle_subscription(cfg: &Config, action: SubscriptionAction) -> Result<()> {
+    let client = ApiClient::new(cfg)?;
+    match action {
+        SubscriptionAction::Create { callback_url, from_ledger, subscription_type, batch_size, batch_timeout_ms } => {
+            let sub = subscription::create(&client, callback_url, from_ledger, subscription_type, batch_size, batch_timeout_ms)?;
+            println!("{} {}", "Created subscription".green().bold(), sub.id);
+            println!("{}", serde_json::to_string_pretty(&sub)?);
+        }
+        SubscriptionAction::Get { id } => {
+            let sub = subscription::get(&client, &id)?;
+            println!("{}", serde_json::to_string_pretty(&sub)?);
+        }
+        SubscriptionAction::Delete { id } => {
+            subscription::delete(&client, &id)?;
+            println!("{} {}", "Deleted subscription".green().bold(), id);
+        }
+        SubscriptionAction::Ack { id, ledger } => {
+            let resp = subscription::ack(&client, &id, ledger)?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+        SubscriptionAction::Pause { id, seconds, reason } => {
+            let resp = subscription::pause(&client, &id, seconds, reason)?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+        SubscriptionAction::Resume { id, reason } => {
+            let resp = subscription::resume(&client, &id, reason)?;
+            println!("{}", serde_json::to_string_pretty(&resp)?);
+        }
+    }
     Ok(())
 }
 

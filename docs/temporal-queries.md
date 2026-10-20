@@ -112,3 +112,12 @@ When `aggregate=true`:
 | 400 – start of window must be before end of window | `from >= to` |
 | 400 – invalid relative time expression | Unknown unit or non-positive value |
 | 400 – invalid window | `window` not one of `1m`, `5m`, `1h`, `1d` |
+| 400 – invalid contract_id format | `contract_id` filter is not a well-formed contract address |
+
+## Testing
+
+Unit tests for the relative-time parser and HTTP-level tests for the basic
+request/error shapes live in `src/handlers.rs` (`mod temporal_tests`).
+`tests/temporal_query_extra_tests.rs` adds coverage for filter combinations
+that narrow results (`contract_id`, `event_type`), absolute timestamp
+ranges against real rows, pagination, and multi-bucket aggregation counts.

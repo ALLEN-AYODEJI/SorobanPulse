@@ -66,18 +66,55 @@ Restart the service. New events are encrypted with the new key. Existing events 
 
 ### Step 2 — Re-encrypt existing events
 
-Trigger the background re-encryption job via the admin API:
+Trigger the background re-encryption job via the admin API. The endpoint is
+blocked behind `ADMIN_API_KEY` (sent as `Authorization: Bearer $ADMIN_API_KEY`
+or `X-Admin-Api-Key`); requests without a valid key return `401`.
 
 ```bash
-curl -X POST https://your-host/v1/admin/reencrypt \
-  -H "Authorization: Bearer $ADMIN_API_KEY"
+curl -X POST https://your-host/v1/admin/encryption/rotate \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"new_key": "<new-64-hex>"}'
 ```
 
-The job fetches all rows where `event_data->>'encrypted' = 'true'`, decrypts each with the old key, and re-encrypts with the new key in configurable batches. Progress is tracked in the `soroban_pulse_reencrypt_rows_remaining` Prometheus metric.
+The body must contain `new_key`, a 64-character hex AES-256 key. The job:
+
+1. Selects rows where `event_data->>'encrypted' = 'true'` that have not yet
+   been re-encrypted, in batches of **100**.
+2. For each batch, opens a transaction, decrypts every credential with the
+   old key (falling back to the current key for rows already rotated),
+   re-encrypts with `new_key`, and commits. Committing per batch keeps row
+   locks short so normal reads and writes are not blocked.
+3. Records progress after each committed batch, so the job is **resumable**:
+   if the process is interrupted, calling `POST /v1/admin/encryption/rotate`
+   again with the same `new_key` continues from the first unprocessed row
+   instead of starting over.
+
+Progress is exposed as the `soroban_pulse_reencryption_progress` Prometheus
+gauge, which reports rows completed divided by the total number of rows to
+re-encrypt (a value from `0` to `1`). The job is complete when the gauge
+reaches `1`.
 
 ### Step 3 — Remove the old key
 
-Once the job completes (metric reaches 0), remove `EVENT_DATA_ENCRYPTION_KEY_OLD` and restart.
+Once the job completes (gauge reaches 1), remove `EVENT_DATA_ENCRYPTION_KEY_OLD` and restart.
+
+### Verifying the rotation
+
+After rotation, decrypting a credential with the old key must fail. You can
+confirm this by attempting a read with only the old key configured:
+
+```bash
+# With EVENT_DATA_ENCRYPTION_KEY set to the OLD key and no fallback key,
+# reads of rotated rows return a decryption error (AES-GCM authentication
+# failure) instead of plaintext.
+EVENT_DATA_ENCRYPTION_KEY=<old-64-hex> EVENT_DATA_ENCRYPTION_KEY_OLD= \
+  cargo run --features encryption -- --check-encryption
+```
+
+If any row still decrypts with the old key, the rotation did not finish —
+re-run the rotation endpoint and wait for `soroban_pulse_reencryption_progress`
+to reach `1` before removing the old key.
 
 ## Encrypted query support
 
@@ -101,3 +138,60 @@ Encrypted rows return `'true'`; plaintext rows return `NULL`.
 - The authentication tag provided by AES-256-GCM detects any tampering with stored ciphertext.
 - Keys are never logged or exposed in metrics.
 - Use a secrets manager (Kubernetes Secrets, AWS Secrets Manager, HashiCorp Vault) to inject `EVENT_DATA_ENCRYPTION_KEY` at runtime rather than committing it to environment files.
+
+## Integration credentials (Issue #1162)
+
+Integration credentials are encrypted at rest with the same AES-256-GCM
+envelope, using a **separate** key. Unlike event encryption, this is always on
+and is not gated on the `encryption` feature.
+
+| Variable | Required | Description |
+|---|---|---|
+| `INTEGRATION_ENCRYPTION_KEY` | Yes in production | 64-char hex AES-256 key, distinct from `EVENT_DATA_ENCRYPTION_KEY` |
+| `INTEGRATION_ENCRYPTION_KEY_OLD` | Only during key rotation | Previous key, kept until re-encryption completes |
+
+### Encrypted columns
+
+| Table | Column | Contents |
+|---|---|---|
+| `github_integrations` | `access_token` | GitHub token |
+| `discord_integrations` | `webhook_url` | Discord webhook URL (embeds the webhook token) |
+| `slack_integrations` | `webhook_url`, `bot_token`, `signing_secret` | Slack webhook URL, bot token, signing secret |
+| `telegram_integrations` | `bot_token` | Telegram bot token |
+| `pagerduty_integrations` | `routing_key`, `api_key` | PagerDuty routing key and REST API key |
+| `notification_channels` | `config` (JSONB) | String values under sensitive keys such as `auth_token`, `api_key`, `bot_token`, `webhook_url`, `password`, `secret`, `token` |
+
+Values are stored as `enc:v1:<base64 envelope>`. The migration
+`20260929000001_encrypt_integration_credentials` adds `NOT VALID` CHECK
+constraints so the database rejects any new plaintext value in these columns.
+
+### Behaviour
+
+- **Writes fail closed:** if `INTEGRATION_ENCRYPTION_KEY` is missing, creating
+  an integration returns `503` instead of storing the credential in plaintext.
+- **API responses are masked:** `GET` endpoints return `****` plus the last
+  four characters (for example `****WXYZ`), never the plaintext or ciphertext.
+- **Backfill:** at startup, rows written before this change are encrypted in
+  place. After the first successful start, validate the constraints (the
+  statements are listed in the migration file), for example:
+
+  ```sql
+  ALTER TABLE github_integrations VALIDATE CONSTRAINT github_integrations_access_token_encrypted;
+  ```
+
+### Rotating the integration key
+
+1. Set `INTEGRATION_ENCRYPTION_KEY` to the new key and
+   `INTEGRATION_ENCRYPTION_KEY_OLD` to the previous key, then restart.
+2. Call `POST /v1/admin/reencrypt`. The response's `jobs` array includes
+   `integration_credentials`. Every credential is decrypted (current or old
+   key) and re-encrypted with the new key.
+3. When the job logs `Integration credential re-encryption completed`, remove
+   `INTEGRATION_ENCRYPTION_KEY_OLD` and restart.
+
+### Verifying
+
+```sql
+-- Should return 0 rows
+SELECT id FROM telegram_integrations WHERE bot_token NOT LIKE 'enc:v1:%';
+```

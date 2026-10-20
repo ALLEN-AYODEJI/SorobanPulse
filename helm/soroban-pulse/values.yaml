@@ -1,9 +1,38 @@
-replicaCount: 2
-
 image:
   repository: soroban-pulse
   tag: latest
   pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+
+terminationGracePeriodSeconds: 30
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
 
 service:
   type: ClusterIP
@@ -31,6 +60,14 @@ env:
   BEHIND_PROXY: "false"
   CONTRACT_COUNT_CACHE_SIZE: "1000"
   CONTRACT_COUNT_CACHE_TTL_SECS: "30"
+
+# Issue #1112: built-in web dashboard served by the backend at /ui.
+dashboard:
+  # Serve the dashboard bundled in the image (sets SERVE_DASHBOARD).
+  enabled: true
+  # Extra API origins the dashboard may call (appended to its CSP connect-src).
+  # Leave empty when the dashboard only talks to this deployment.
+  connectSrc: []
 
 # Sensitive values — injected into a Kubernetes Secret.
 # For production, prefer existingSecret (see helm/soroban-pulse/README.md).
@@ -76,3 +113,177 @@ readinessProbe:
   initialDelaySeconds: 5
   periodSeconds: 10
   failureThreshold: 3
+
+extraEnv: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+# ── Database Migration Job (pre-install / pre-upgrade hook) ──────────────────
+# Issue #1147: runs database migrations as a Helm hook before any application
+# pod is started or replaced.  If the Job fails Helm aborts the release and
+# the existing pods are left running and untouched.
+#
+# To use this together with the startup-migration guard, also set:
+#   env:
+#     RUN_MIGRATIONS_ON_STARTUP: "false"
+# …so that the application pods themselves skip the migration step.
+migrationJob:
+  # Set to false to disable the hook Job (e.g., if you run migrations out-of-band).
+  enabled: true
+
+  # Maximum number of retry attempts before Helm marks the release as failed.
+  backoffLimit: 2
+
+  # Hard deadline (seconds) for the entire Job including retries.
+  # Increase this for large / long-running migrations (e.g., table partitioning).
+  activeDeadlineSeconds: 600
+
+  # Seconds after the Job finishes before Kubernetes garbage-collects it.
+  # 86400 = keep for 24 h so logs are available for debugging.
+  # Set to 0 to delete immediately; omit the key to keep indefinitely.
+  ttlSecondsAfterFinished: 86400
+
+  # Resource requests and limits for the migration container.
+  # These can be tighter than the main app since migrations are short-lived.
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+
+  # Optional extra environment variables injected into the migration container.
+  extraEnv: []
+  # - name: EXAMPLE
+  #   value: "value"
+
+  # Optional pod annotations for the migration Job pod (e.g., Vault injection).
+  podAnnotations: {}
+
+  # Override node selector / tolerations for the migration pod.
+  # When empty, inherits from the top-level nodeSelector / tolerations above.
+  nodeSelector: {}
+  tolerations: []
+
+# ── Prometheus Operator: ServiceMonitor ──────────────────────────────────────
+# Requires the Prometheus Operator (kube-prometheus-stack or standalone) to be
+# installed in the cluster.  When enabled, a ServiceMonitor is created so
+# Prometheus automatically discovers and scrapes the /metrics endpoint.
+serviceMonitor:
+  # Set to true to create the ServiceMonitor resource.
+  enabled: false
+  # Override the namespace the ServiceMonitor is created in.
+  # Defaults to the release namespace when left empty.
+  namespace: ""
+  # HTTP path Prometheus scrapes for metrics.
+  path: /metrics
+  # How often Prometheus scrapes the target.
+  interval: 30s
+  # Per-scrape timeout (must be <= interval).
+  scrapeTimeout: 10s
+  # Extra labels to add to the ServiceMonitor metadata.
+  # Use this to match the Prometheus Operator's serviceMonitorSelector, e.g.:
+  #   additionalLabels:
+  #     release: kube-prometheus-stack
+  additionalLabels: {}
+  # Prometheus relabeling rules applied before ingestion.
+  relabelings: []
+  # Metric relabeling rules applied after scraping.
+  metricRelabelings: []
+
+# ── Prometheus Operator: PrometheusRule ──────────────────────────────────────
+# Creates a PrometheusRule containing all alerting rules from docs/alerts.yml.
+# Requires the Prometheus Operator CRD to be present.
+prometheusRule:
+  # Set to true to create the PrometheusRule resource.
+  enabled: false
+  # Override the namespace the PrometheusRule is created in.
+  # Defaults to the release namespace when left empty.
+  namespace: ""
+  # Extra labels to add to the PrometheusRule metadata.
+  # Use this to match the Prometheus Operator's ruleSelector, e.g.:
+  #   additionalLabels:
+  #     release: kube-prometheus-stack
+  additionalLabels: {}
+
+# ── Kubernetes NetworkPolicy ──────────────────────────────────────────────────
+# When enabled, a NetworkPolicy is applied to the pods so that:
+#   Ingress: only the ingress controller and Prometheus may reach the service port.
+#   Egress:  pods may only connect to PostgreSQL, the Stellar RPC endpoint, and DNS.
+# Requires a CNI plugin that enforces NetworkPolicies (e.g. Calico, Cilium, Weave).
+networkPolicy:
+  # Set to true to create the NetworkPolicy resource.
+  enabled: false
+
+  # Selectors for the ingress controller pods/namespace.
+  # Adjust to match your cluster's ingress controller.
+  # Example for ingress-nginx installed via the official chart:
+  #   ingressController:
+  #     namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: ingress-nginx
+  #     podSelector:
+  #       matchLabels:
+  #         app.kubernetes.io/name: ingress-nginx
+  ingressController:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: ingress-nginx
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: ingress-nginx
+
+  # Selectors for Prometheus pods/namespace.
+  # Example for kube-prometheus-stack:
+  #   prometheus:
+  #     namespaceSelector:
+  #       matchLabels:
+  #         kubernetes.io/metadata.name: monitoring
+  #     podSelector:
+  #       matchLabels:
+  #         app.kubernetes.io/name: prometheus
+  prometheus:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: monitoring
+    podSelector:
+      matchLabels:
+        app.kubernetes.io/name: prometheus
+
+  egress:
+    # TCP port used to reach PostgreSQL (default: 5432).
+    postgresPort: 5432
+    # TCP port used to reach the Stellar Soroban RPC endpoint over HTTPS (default: 443).
+    rpcPort: 443
+    # Additional egress ports to allow (e.g. SMTP, external APIs).
+    # Each entry must have a port field and an optional protocol (defaults to TCP).
+    # extraPorts:
+    #   - port: 587
+    #     protocol: TCP
+    extraPorts: []
+
+# ── Grafana dashboard ConfigMap ───────────────────────────────────────────────
+# Creates a ConfigMap containing the pre-built Grafana dashboard JSON.
+# When the Grafana sidecar (grafana-sc-dashboard) is running it will
+# automatically load any ConfigMap labelled with the configured sidecar label.
+grafana:
+  dashboardConfigMap:
+    # Set to true to create the ConfigMap.
+    enabled: false
+    # Namespace to create the ConfigMap in.
+    # Defaults to the release namespace when left empty.
+    namespace: ""
+    # Label key/value that the Grafana sidecar watches.
+    # Must match grafana.sidecar.dashboards.label in your Grafana Helm values.
+    sidecarLabel: grafana_dashboard
+    sidecarLabelValue: "1"
+    # Extra labels added to the ConfigMap metadata.
+    additionalLabels: {}
+    # Annotations added to the ConfigMap metadata.
+    # Use grafana_dashboard_folder to place the dashboard in a specific folder:
+    #   annotations:
+    #     grafana_dashboard_folder: SorobanPulse
+    annotations: {}

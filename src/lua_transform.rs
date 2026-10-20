@@ -363,6 +363,25 @@ impl LuaTransformer {
             .context("failed to compile preview script")?;
         Self::transform_sync(&lua, event)
     }
+
+    /// Wrap a bare script body into an implicit `transform_event` function
+    /// definition, so callers of the replay-with-transform endpoint can pass
+    /// a short expression (e.g. `"return event"`) instead of a full script
+    /// that defines `transform_event` itself.
+    pub fn wrap_script_body(body: &str) -> String {
+        format!("function transform_event(event)\n{body}\nend")
+    }
+
+    /// Check that a (already-wrapped) script compiles as valid Lua, without
+    /// executing it. Used to reject malformed scripts with a 400 before any
+    /// events are touched.
+    pub fn validate_syntax(script: &str) -> Result<(), String> {
+        let lua = Lua::new();
+        lua.load(script)
+            .into_function()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]

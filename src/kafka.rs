@@ -162,4 +162,74 @@ pub mod tests {
         }
         assert_eq!(publisher.published.lock().unwrap().len(), 5);
     }
+
+    #[tokio::test]
+    async fn partition_key_strategy_uses_contract_id() {
+        let publisher = MockKafkaPublisher::default();
+
+        let e1 = make_event("CONTRACT_A");
+        let e2 = make_event("CONTRACT_B");
+        let e3 = make_event("CONTRACT_A");  // Same contract as e1
+
+        publisher.publish("events", &e1).await.unwrap();
+        publisher.publish("events", &e2).await.unwrap();
+        publisher.publish("events", &e3).await.unwrap();
+
+        let published = publisher.published.lock().unwrap();
+        assert_eq!(published.len(), 3);
+
+        // All events with same contract should use same partition key
+        assert_eq!(published[0].1.contract_id, published[2].1.contract_id);
+        assert_ne!(published[0].1.contract_id, published[1].1.contract_id);
+    }
+
+    #[tokio::test]
+    async fn topic_name_preserved_in_publication() {
+        let publisher = MockKafkaPublisher::default();
+        let event = make_event("CABC");
+
+        publisher.publish("custom-topic", &event).await.unwrap();
+
+        let published = publisher.published.lock().unwrap();
+        assert_eq!(published[0].0, "custom-topic");
+    }
+
+    #[tokio::test]
+    async fn error_state_persists_across_calls() {
+        let publisher = MockKafkaPublisher::default();
+        *publisher.fail_with.lock().unwrap() = Some("simulated failure".to_string());
+
+        let e1 = publisher.publish("events", &make_event("C1")).await;
+        let e2 = publisher.publish("events", &make_event("C2")).await;
+
+        assert!(e1.is_err());
+        assert!(e2.is_err());
+        assert!(publisher.published.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn event_data_serialization() {
+        use serde_json::Value;
+
+        let publisher = MockKafkaPublisher::default();
+        let event = SorobanEvent {
+            contract_id: "CABC".to_string(),
+            event_type: "contract".to_string(),
+            tx_hash: "hash123".to_string(),
+            ledger: 100,
+            ledger_closed_at: "2026-03-14T00:00:00Z".to_string(),
+            value: Value::Object({
+                let mut map = serde_json::Map::new();
+                map.insert("amount".to_string(), Value::String("1000".to_string()));
+                map
+            }),
+            topic: Some(vec!["transfer".to_string()]),
+        };
+
+        publisher.publish("events", &event).await.unwrap();
+
+        let published = publisher.published.lock().unwrap();
+        assert_eq!(published[0].1.contract_id, "CABC");
+        assert_eq!(published[0].1.ledger, 100);
+    }
 }

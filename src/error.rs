@@ -1,5 +1,33 @@
+//! # Error handling module — Issue #662 / #992
+//!
+//! Consolidates all application error types into a single, consistent module.
+//!
+//! ## Design
+//! - [`AppError`] is the top-level unified error enum used across all handlers.
+//! - Domain-specific error sub-types ([`DatabaseError`], [`IndexerError`],
+//!   [`WebhookError`], [`SubscriptionError`], [`AuthError`], [`RpcError`])
+//!   convert automatically into [`AppError`] via `From` implementations.
+//! - [`ErrorContext`] attaches structured metadata (operation, entity, request_id)
+//!   to any error for richer log output and API responses.
+//! - [`ErrorResponse`] is the machine-readable JSON body returned to clients.
+//! - [`ErrorRecovery`] provides standardized recovery suggestions for common errors.
+//!
+//! ## Extension Points
+//! Add a new domain error by:
+//! 1. Declaring a variant in the appropriate domain enum (or adding a new enum).
+//! 2. Implementing `From<YourDomainError> for AppError`.
+//! 3. Adding a `(StatusCode, &'static str)` arm inside `AppError::status_and_code`.
+//!
+//! ## Standardized Constructors
+//! Use the convenience constructors on [`AppError`] instead of manually
+//! constructing enum variants:
+//! ```rust,ignore
+//! return Err(AppError::validation("invalid input"));
+//! return Err(AppError::internal("something went wrong"));
+//! ```
+
 use axum::{
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -8,16 +36,24 @@ use std::cell::RefCell;
 use thiserror::Error;
 use uuid::Uuid;
 
+// ---------------------------------------------------------------------------
+// Request-scoped correlation ID (thread-local)
+// ---------------------------------------------------------------------------
+
 thread_local! {
     static REQUEST_ID: RefCell<Option<String>> = RefCell::new(None);
 }
 
+/// Store a request-scoped correlation ID so that all errors produced during
+/// a handler invocation can reference it automatically.
 pub fn set_request_id(id: String) {
     REQUEST_ID.with(|rid| {
         *rid.borrow_mut() = Some(id);
     });
 }
 
+/// Retrieve the current request-scoped correlation ID, generating a fresh UUID
+/// if none has been set.
 pub fn get_request_id() -> String {
     REQUEST_ID.with(|rid| {
         rid.borrow()
@@ -26,198 +62,988 @@ pub fn get_request_id() -> String {
     })
 }
 
-/// Machine-readable error response body.
+// ---------------------------------------------------------------------------
+// Structured API response body
+// ---------------------------------------------------------------------------
+
+/// Machine-readable error response returned in the `application/json` body.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct ErrorResponse {
+    /// Human-readable description of what went wrong.
     pub error: String,
+    /// Machine-readable error code (e.g. `"VALIDATION_ERROR"`).
     pub code: &'static str,
+    /// Correlation ID that ties this response to a specific request in logs.
     pub correlation_id: String,
+    /// Optional operation context (which logical action failed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// Optional entity context (which resource was involved).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity: Option<String>,
+    /// Field-level validation details (only present for `VALIDATION_ERROR`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_errors: Option<Vec<ValidationErrorDetail>>,
 }
 
-/// Details of a single validation error.
-#[derive(Debug, Serialize, utoipa::ToSchema)]
+/// Details of a single field-level validation failure.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct ValidationErrorDetail {
+    /// JSON Pointer to the offending value (e.g. `"/page"`).
     pub instance_path: String,
+    /// The schema constraint that was violated.
     pub schema_path: String,
+    /// Human-readable explanation.
     pub message: String,
 }
 
+// ---------------------------------------------------------------------------
+// RFC 9457 Problem Details — Issue #1265
+// ---------------------------------------------------------------------------
+
+/// Base URI used to build the `type` field of a [`ProblemDetail`].
+pub const PROBLEM_TYPE_BASE_URI: &str = "https://sorobanpulse.dev/errors/";
+
+/// RFC 9457 `application/problem+json` error body.
+///
+/// This is the wire format for all error responses.  `ErrorResponse` is kept
+/// for internal use (logging, tests) but is no longer emitted to clients.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct ProblemDetail {
+    /// A URI reference that identifies the problem type.
+    ///
+    /// When dereferenced, it should provide human-readable documentation for
+    /// the problem type.  Built as `https://sorobanpulse.dev/errors/<code>`.
+    #[serde(rename = "type")]
+    pub type_uri: String,
+    /// A short, human-readable summary of the problem type.
+    pub title: String,
+    /// The HTTP status code generated by the origin server for this occurrence.
+    pub status: u16,
+    /// A human-readable explanation specific to this occurrence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A URI reference that identifies the specific occurrence of the problem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// Correlation ID that ties this response to a specific request in logs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    /// Field-level validation details (only present for `VALIDATION_ERROR`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_errors: Option<Vec<ValidationErrorDetail>>,
+}
+
+impl ProblemDetail {
+    /// Build the `type` URI for a machine-readable error code.
+    pub fn type_uri_for_code(code: &str) -> String {
+        format!("{}{}", PROBLEM_TYPE_BASE_URI, code.to_ascii_lowercase())
+    }
+
+    /// Build a human-readable `title` from a machine-readable error code.
+    ///
+    /// e.g. `"VALIDATION_ERROR"` → `"Validation Error"`.
+    pub fn title_for_code(code: &str) -> String {
+        code.split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                match chars.next() {
+                    Some(first) => {
+                        let mut word = first.to_uppercase().collect::<String>();
+                        word.push_str(&chars.as_str().to_ascii_lowercase());
+                        word
+                    }
+                    None => String::new(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error context — attach structured metadata to errors
+// ---------------------------------------------------------------------------
+
+/// Metadata that can be attached to an [`AppError`] to provide richer
+/// diagnostics in logs and API responses.
+#[derive(Debug, Clone, Default)]
+pub struct ErrorContext {
+    /// The logical operation that was being attempted (e.g. `"fetch_events"`).
+    pub operation: Option<String>,
+    /// The entity being operated on (e.g. `"contract:CABC..."`).
+    pub entity: Option<String>,
+    /// Overrides the auto-generated correlation ID when set explicitly.
+    pub request_id: Option<String>,
+}
+
+impl ErrorContext {
+    /// Create a new empty context.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the operation name.
+    pub fn with_operation(mut self, op: impl Into<String>) -> Self {
+        self.operation = Some(op.into());
+        self
+    }
+
+    /// Set the entity description.
+    pub fn with_entity(mut self, entity: impl Into<String>) -> Self {
+        self.entity = Some(entity.into());
+        self
+    }
+
+    /// Override the correlation / request ID.
+    pub fn with_request_id(mut self, id: impl Into<String>) -> Self {
+        self.request_id = Some(id.into());
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error recovery — standardized recovery suggestions
+// ---------------------------------------------------------------------------
+
+/// Provides a human-readable suggestion for recovering from an error.
+/// Used by handlers to give users actionable guidance.
+#[derive(Debug, Clone)]
+pub struct ErrorRecovery {
+    /// A brief suggestion for the user (e.g. "Check your API key and try again").
+    pub suggestion: String,
+    /// An optional link to documentation about the error.
+    pub doc_link: Option<String>,
+}
+
+impl ErrorRecovery {
+    /// Create a new recovery suggestion.
+    pub fn new(suggestion: impl Into<String>) -> Self {
+        Self {
+            suggestion: suggestion.into(),
+            doc_link: None,
+        }
+    }
+
+    /// Set an optional documentation link.
+    pub fn with_doc(mut self, link: impl Into<String>) -> Self {
+        self.doc_link = Some(link.into());
+        self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Domain-specific error types
+// ---------------------------------------------------------------------------
+
+/// Errors originating from database operations.
+#[derive(Debug, Error)]
+pub enum DatabaseError {
+    #[error("Query failed: {0}")]
+    QueryFailed(#[from] sqlx::Error),
+
+    #[error("Query timed out")]
+    Timeout,
+
+    #[error("Record not found: {0}")]
+    NotFound(String),
+
+    #[error("Unique constraint violation: {0}")]
+    UniqueViolation(String),
+
+    #[error("Connection pool exhausted")]
+    PoolExhausted,
+}
+
+/// Errors originating from the background indexer.
+#[derive(Debug, Error)]
+pub enum IndexerError {
+    #[error("RPC call failed: {0}")]
+    RpcCallFailed(String),
+
+    #[error("Ledger gap detected: expected {expected}, got {got}")]
+    LedgerGap { expected: u64, got: u64 },
+
+    #[error("Advisory lock not acquired")]
+    LockNotAcquired,
+
+    #[error("Indexer stalled: last ledger {last_ledger}")]
+    Stalled { last_ledger: u64 },
+}
+
+/// Errors originating from webhook delivery.
+#[derive(Debug, Error)]
+pub enum WebhookError {
+    #[error("Delivery failed after {attempts} attempts: {reason}")]
+    DeliveryFailed { attempts: u32, reason: String },
+
+    #[error("Invalid endpoint URL: {0}")]
+    InvalidEndpoint(String),
+
+    #[error("HMAC signature mismatch")]
+    SignatureMismatch,
+}
+
+/// Errors originating from subscription management.
+#[derive(Debug, Error)]
+pub enum SubscriptionError {
+    #[error("Subscription not found: {0}")]
+    NotFound(String),
+
+    #[error("Invalid filter: {0}")]
+    InvalidFilter(String),
+
+    #[error("Subscription limit exceeded")]
+    LimitExceeded,
+}
+
+/// Authentication and authorisation errors.
+#[derive(Debug, Error)]
+pub enum AuthError {
+    #[error("Missing or invalid API key")]
+    Unauthenticated,
+
+    #[error("Insufficient privileges: {0}")]
+    Forbidden(String),
+
+    #[error("Token expired")]
+    TokenExpired,
+}
+
+/// Errors from external RPC / network calls.
+#[derive(Debug, Error)]
+pub enum RpcError {
+    #[error("Network error: {0}")]
+    Network(#[from] reqwest::Error),
+
+    #[error("Unexpected response: {0}")]
+    UnexpectedResponse(String),
+
+    #[error("Rate limited by upstream")]
+    RateLimited,
+}
+
+// ---------------------------------------------------------------------------
+// Unified AppError
+// ---------------------------------------------------------------------------
+
+/// The single unified error type used throughout the application.
+///
+/// Every handler and service function returns `Result<T, AppError>`.
+/// Domain errors convert automatically via their `From` implementations.
+///
+/// ## Adding a new error kind
+/// 1. Add a variant here (or to an existing domain enum above).
+/// 2. Add a match arm in [`AppError::status_and_code`].
+/// 3. If it wraps a domain enum, add a `From` impl below.
+///
+/// ## Standardized Constructors
+/// Use convenience methods like [`AppError::validation`],
+/// [`AppError::internal`], [`AppError::not_found`] etc. instead of
+/// manually constructing enum variants.
 #[derive(Debug, Error)]
 pub enum AppError {
+    // --- database domain --------------------------------------------------
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
+    #[error("Database error: {0}")]
+    DatabaseDomain(DatabaseError),
+
+    // --- network / RPC domain ---------------------------------------------
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    #[error("RPC error: {0}")]
+    Rpc(RpcError),
+
+    // --- indexer domain ---------------------------------------------------
+    #[error("Indexer error: {0}")]
+    Indexer(IndexerError),
+
+    // --- webhook domain ---------------------------------------------------
+    #[error("Webhook error: {0}")]
+    Webhook(WebhookError),
+
+    // --- subscription domain ----------------------------------------------
+    #[error("Subscription error: {0}")]
+    Subscription(SubscriptionError),
+
+    // --- auth domain ------------------------------------------------------
+    #[error("Authentication error: {0}")]
+    Auth(AuthError),
+
+    // --- generic / cross-cutting ------------------------------------------
     #[error("Not found")]
     NotFound,
 
     #[error("Validation error: {0}")]
     Validation(String),
 
-    #[error("Forbidden: {0}")]
-    Forbidden(String),
-
     #[error("Validation error with details")]
     ValidationWithDetails(String, Vec<ValidationErrorDetail>),
 
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
+    #[error("Callback URL not allowed: {0}")]
+    CallbackUrlNotAllowed(String),
+
     #[error("Internal error: {0}")]
+    // Reserved for surfacing raw internal errors in tests and future integrations;
+    // not constructed in production paths today.
     #[allow(dead_code)]
     Internal(String),
+
+    // --- errors with attached context ------------------------------------
+    /// An error bundled with rich context metadata.  Use
+    /// [`AppError::with_context`] to construct these.
+    #[error("{source}: op={op:?} entity={entity:?}")]
+    WithContext {
+        source: Box<AppError>,
+        op: Option<String>,
+        entity: Option<String>,
+    },
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
+// ---------------------------------------------------------------------------
+// Domain-error → AppError conversions
+// ---------------------------------------------------------------------------
+
+impl From<DatabaseError> for AppError {
+    fn from(e: DatabaseError) -> Self {
+        AppError::DatabaseDomain(e)
+    }
+}
+
+impl From<RpcError> for AppError {
+    fn from(e: RpcError) -> Self {
+        AppError::Rpc(e)
+    }
+}
+
+impl From<IndexerError> for AppError {
+    fn from(e: IndexerError) -> Self {
+        AppError::Indexer(e)
+    }
+}
+
+impl From<WebhookError> for AppError {
+    fn from(e: WebhookError) -> Self {
+        AppError::Webhook(e)
+    }
+}
+
+impl From<SubscriptionError> for AppError {
+    fn from(e: SubscriptionError) -> Self {
+        AppError::Subscription(e)
+    }
+}
+
+impl From<AuthError> for AppError {
+    fn from(e: AuthError) -> Self {
+        AppError::Auth(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context attachment and standardized constructors
+// ---------------------------------------------------------------------------
+
+impl AppError {
+    /// Attach structured context metadata to this error.
+    ///
+    /// ```rust,ignore
+    /// return Err(AppError::NotFound.with_context(
+    ///     ErrorContext::new()
+    ///         .with_operation("get_event")
+    ///         .with_entity(format!("event:{}", id)),
+    /// ));
+    /// ```
+    pub fn with_context(self, ctx: ErrorContext) -> Self {
+        AppError::WithContext {
+            source: Box::new(self),
+            op: ctx.operation,
+            entity: ctx.entity,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Standardized constructors — Issue #992
+    // -----------------------------------------------------------------------
+
+    /// Create a validation error from a message.
+    pub fn validation(msg: impl Into<String>) -> Self {
+        AppError::Validation(msg.into())
+    }
+
+    /// Create an internal error from a message.
+    pub fn internal(msg: impl Into<String>) -> Self {
+        AppError::Internal(msg.into())
+    }
+
+    /// Create a not-found error.
+    pub fn not_found() -> Self {
+        AppError::NotFound
+    }
+
+    /// Create a forbidden error with a message.
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        AppError::Forbidden(msg.into())
+    }
+
+    /// Create an error indicating a callback URL was rejected by the allowlist.
+    pub fn callback_url_not_allowed(msg: impl Into<String>) -> Self {
+        AppError::CallbackUrlNotAllowed(msg.into())
+    }
+
+    /// Create an unauthorized error.
+    pub fn unauthorized() -> Self {
+        AppError::Auth(AuthError::Unauthenticated)
+    }
+
+    /// Create a rate-limited error.
+    pub fn rate_limited() -> Self {
+        AppError::Subscription(SubscriptionError::LimitExceeded)
+    }
+
+    // -----------------------------------------------------------------------
+    // Status code + machine-readable code mapping
+    // -----------------------------------------------------------------------
+
+    /// Returns the HTTP status code and machine-readable error code string for
+    /// this error.  This is the single authoritative mapping — add new variants
+    /// here when extending the error taxonomy.
+    pub fn status_and_code(&self) -> (StatusCode, &'static str) {
+        match self {
+            AppError::NotFound => (StatusCode::NOT_FOUND, "NOT_FOUND"),
+
+            AppError::Validation(_) | AppError::ValidationWithDetails(_, _) => {
+                (StatusCode::BAD_REQUEST, "VALIDATION_ERROR")
+            }
+
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "FORBIDDEN"),
+
+            AppError::CallbackUrlNotAllowed(_) => {
+                (StatusCode::BAD_REQUEST, "CALLBACK_URL_NOT_ALLOWED")
+            }
+
+            AppError::Auth(AuthError::Unauthenticated) | AppError::Auth(AuthError::TokenExpired) => {
+                (StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
+            }
+            AppError::Auth(AuthError::Forbidden(_)) => (StatusCode::FORBIDDEN, "FORBIDDEN"),
+
+            AppError::Database(e) if is_query_timeout_sqlx(e) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_TIMEOUT")
+            }
+            AppError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
+
+            AppError::DatabaseDomain(DatabaseError::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, "NOT_FOUND")
+            }
+            AppError::DatabaseDomain(DatabaseError::Timeout) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_TIMEOUT")
+            }
+            AppError::DatabaseDomain(DatabaseError::UniqueViolation(_)) => {
+                (StatusCode::CONFLICT, "CONFLICT")
+            }
+            AppError::DatabaseDomain(DatabaseError::PoolExhausted) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_POOL_EXHAUSTED")
+            }
+            AppError::DatabaseDomain(_) => (StatusCode::INTERNAL_SERVER_ERROR, "DATABASE_ERROR"),
+
+            AppError::Rpc(RpcError::RateLimited) => {
+                (StatusCode::TOO_MANY_REQUESTS, "UPSTREAM_RATE_LIMITED")
+            }
+            AppError::Rpc(_) | AppError::Http(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+            }
+
+            AppError::Indexer(IndexerError::LockNotAcquired) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "INDEXER_LOCK_NOT_ACQUIRED")
+            }
+            AppError::Indexer(IndexerError::Stalled { .. }) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "INDEXER_STALLED")
+            }
+            AppError::Indexer(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INDEXER_ERROR"),
+
+            AppError::Webhook(WebhookError::InvalidEndpoint(_)) => {
+                (StatusCode::BAD_REQUEST, "INVALID_WEBHOOK_ENDPOINT")
+            }
+            AppError::Webhook(WebhookError::SignatureMismatch) => {
+                (StatusCode::UNAUTHORIZED, "WEBHOOK_SIGNATURE_MISMATCH")
+            }
+            AppError::Webhook(_) => (StatusCode::INTERNAL_SERVER_ERROR, "WEBHOOK_ERROR"),
+
+            AppError::Subscription(SubscriptionError::NotFound(_)) => {
+                (StatusCode::NOT_FOUND, "NOT_FOUND")
+            }
+            AppError::Subscription(SubscriptionError::InvalidFilter(_)) => {
+                (StatusCode::BAD_REQUEST, "INVALID_SUBSCRIPTION_FILTER")
+            }
+            AppError::Subscription(SubscriptionError::LimitExceeded) => {
+                (StatusCode::TOO_MANY_REQUESTS, "SUBSCRIPTION_LIMIT_EXCEEDED")
+            }
+
+            AppError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+
+            AppError::WithContext { source, .. } => source.status_and_code(),
+        }
+    }
+
+    /// Build the full [`ErrorResponse`] for this error.
+    fn build_response(&self) -> (StatusCode, ErrorResponse) {
+        let (status, code) = self.status_and_code();
         let correlation_id = get_request_id();
 
-        let (status, message, code, validation_errors) = match &self {
-            AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string(), "NOT_FOUND", None),
-            AppError::Validation(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "VALIDATION_ERROR", None),
-            AppError::ValidationWithDetails(msg, errors) => (
-                StatusCode::BAD_REQUEST,
-                msg.clone(),
-                "VALIDATION_ERROR",
-                Some(errors.clone()),
-            ),
-            AppError::Forbidden(msg) => (
-                StatusCode::FORBIDDEN,
-                msg.clone(),
-                "FORBIDDEN",
-                None,
-            ),
+        // Extract context metadata from WithContext wrapper if present.
+        let (operation, entity) = if let AppError::WithContext { op, entity, .. } = self {
+            (op.clone(), entity.clone())
+        } else {
+            (None, None)
+        };
+
+        // Unwrap through context to reach the underlying error for the message.
+        let inner = self.inner();
+
+        let (message, validation_errors) = match inner {
+            AppError::Validation(msg) => (msg.clone(), None),
+            AppError::ValidationWithDetails(msg, errors) => (msg.clone(), Some(errors.clone())),
+            AppError::Forbidden(msg) => (msg.clone(), None),
+            AppError::CallbackUrlNotAllowed(msg) => (msg.clone(), None),
+            AppError::Auth(AuthError::Forbidden(msg)) => (msg.clone(), None),
+            AppError::DatabaseDomain(DatabaseError::NotFound(msg)) => (msg.clone(), None),
+            AppError::DatabaseDomain(DatabaseError::UniqueViolation(msg)) => (msg.clone(), None),
+            AppError::Subscription(SubscriptionError::NotFound(msg)) => (msg.clone(), None),
+            AppError::Subscription(SubscriptionError::InvalidFilter(msg)) => (msg.clone(), None),
+            AppError::Webhook(WebhookError::InvalidEndpoint(msg)) => (msg.clone(), None),
+            AppError::Database(e) if is_query_timeout_sqlx(e) => {
+                ("query timeout".to_string(), None)
+            }
             AppError::Database(e) => {
-                if is_query_timeout(e) {
-                    let body = ErrorResponse {
-                        error: "query timeout".to_string(),
-                        code: "DATABASE_ERROR",
-                        correlation_id,
-                        validation_errors: None,
-                    };
-                    return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
-                }
-                tracing::error!(
-                    error = %e,
-                    "Database error"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".to_string(),
-                    "DATABASE_ERROR",
-                    None,
-                )
+                tracing::error!(error = %e, "Database error");
+                ("internal server error".to_string(), None)
+            }
+            AppError::DatabaseDomain(e) => {
+                tracing::error!(error = %e, "Database domain error");
+                ("internal server error".to_string(), None)
             }
             AppError::Http(e) => {
-                tracing::error!(
-                    error = %e,
-                    "HTTP error"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".to_string(),
-                    "INTERNAL_ERROR",
-                    None,
-                )
+                tracing::error!(error = %e, "HTTP error");
+                ("internal server error".to_string(), None)
+            }
+            AppError::Rpc(e) => {
+                tracing::error!(error = %e, "RPC error");
+                ("internal server error".to_string(), None)
+            }
+            AppError::Indexer(e) => {
+                tracing::error!(error = %e, "Indexer error");
+                (e.to_string(), None)
+            }
+            AppError::Webhook(e) => {
+                tracing::error!(error = %e, "Webhook error");
+                ("webhook error".to_string(), None)
             }
             AppError::Internal(msg) => {
-                tracing::error!(
-                    error = %msg,
-                    "Internal error"
-                );
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".to_string(),
-                    "INTERNAL_ERROR",
-                    None,
-                )
+                tracing::error!(error = %msg, "Internal error");
+                ("internal server error".to_string(), None)
             }
+            AppError::NotFound => ("not found".to_string(), None),
+            AppError::Auth(AuthError::Unauthenticated) => ("unauthorized".to_string(), None),
+            AppError::Auth(AuthError::TokenExpired) => ("token expired".to_string(), None),
+            _ => ("internal server error".to_string(), None),
         };
 
         let body = ErrorResponse {
             error: message,
             code,
             correlation_id,
+            operation,
+            entity,
             validation_errors,
         };
-        (status, Json(body)).into_response()
+
+        (status, body)
+    }
+
+    /// Unwrap through any `WithContext` wrappers to reach the base error.
+    fn inner(&self) -> &AppError {
+        match self {
+            AppError::WithContext { source, .. } => source.inner(),
+            other => other,
+        }
+    }
+
+    /// Build the RFC 9457 [`ProblemDetail`] body for this error.
+    ///
+    /// `instance` should be the request path (e.g. `"/v1/events/123"`) when
+    /// available; pass `None` otherwise.
+    pub fn to_problem_detail(&self, instance: Option<String>) -> ProblemDetail {
+        let (status, code) = self.status_and_code();
+        let (_, body) = self.build_response();
+
+        ProblemDetail {
+            type_uri: ProblemDetail::type_uri_for_code(code),
+            title: ProblemDetail::title_for_code(code),
+            status: status.as_u16(),
+            detail: Some(body.error),
+            instance,
+            correlation_id: Some(body.correlation_id),
+            validation_errors: body.validation_errors,
+        }
+    }
+
+    /// Convenience method: produce `(StatusCode, Json<ProblemDetail>)` tuple.
+    pub fn into_response_parts(self) -> (StatusCode, Json<ProblemDetail>) {
+        let (status, _) = self.status_and_code();
+        let problem = self.to_problem_detail(None);
+        (status, Json(problem))
     }
 }
 
-impl AppError {
-    pub fn into_response_parts(self) -> (StatusCode, Json<serde_json::Value>) {
-        let correlation_id = get_request_id();
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, _) = self.status_and_code();
+        let problem = self.to_problem_detail(None);
 
-        let (status, message, code, validation_errors) = match &self {
-            AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string(), "NOT_FOUND", None),
-            AppError::Validation(msg) => (StatusCode::BAD_REQUEST, msg.clone(), "VALIDATION_ERROR", None),
-            AppError::ValidationWithDetails(msg, errors) => (
-                StatusCode::BAD_REQUEST,
-                msg.clone(),
-                "VALIDATION_ERROR",
-                Some(errors.clone()),
-            ),
-            AppError::Forbidden(msg) => (
-                StatusCode::FORBIDDEN,
-                msg.clone(),
-                "FORBIDDEN",
-                None,
-            ),
-            AppError::Database(e) => {
-                if is_query_timeout(e) {
-                    let body = serde_json::json!({
-                        "error": "query timeout",
-                        "code": "DATABASE_ERROR",
-                        "correlation_id": correlation_id,
-                    });
-                    return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
-                }
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error".to_string(),
-                    "DATABASE_ERROR",
-                    None,
-                )
-            }
-            AppError::Forbidden(msg) => (
-                StatusCode::FORBIDDEN,
-                msg.clone(),
-                "FORBIDDEN".to_string(),
-                None,
-            ),
-            AppError::Http(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error".to_string(),
-                "INTERNAL_ERROR",
-                None,
-            ),
-            AppError::Internal(_) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal server error".to_string(),
-                "INTERNAL_ERROR",
-                None,
-            ),
-        };
-
-        let mut body = serde_json::json!({
-            "error": message,
-            "code": code,
-            "correlation_id": correlation_id,
+        let body = serde_json::to_vec(&problem).unwrap_or_else(|_| {
+            // Fallback: should be unreachable, but never panic in a response path.
+            let fallback = ProblemDetail {
+                type_uri: ProblemDetail::type_uri_for_code("INTERNAL_ERROR"),
+                title: ProblemDetail::title_for_code("INTERNAL_ERROR"),
+                status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                detail: Some("internal server error".to_string()),
+                instance: None,
+                correlation_id: Some(get_request_id()),
+                validation_errors: None,
+            };
+            serde_json::to_vec(&fallback).unwrap_or_else(|_| b"{}".to_vec())
         });
 
-        if let Some(errors) = validation_errors {
-            body["validation_errors"] = serde_json::to_value(errors).unwrap_or(serde_json::json!([]));
-        }
-
-        (status, Json(body))
+        let mut response = (status, body).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
+        response
     }
 }
 
-fn is_query_timeout(e: &sqlx::Error) -> bool {
-    // Postgres error code 57014 = query_canceled (covers statement_timeout)
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when the sqlx error represents a Postgres query timeout
+/// (error code 57014 = `query_canceled`, which covers `statement_timeout`).
+fn is_query_timeout_sqlx(e: &sqlx::Error) -> bool {
     if let sqlx::Error::Database(db_err) = e {
         return db_err.code().as_deref() == Some("57014");
     }
     false
+}
+
+/// Convenience trait that adds `.with_context(ctx)` to `Result<T, AppError>`.
+///
+/// ```rust,ignore
+/// use crate::error::{ErrorContext, ResultExt};
+/// pool.fetch_one(&query)
+///     .await
+///     .map_err(AppError::from)
+///     .with_error_context(ErrorContext::new().with_operation("get_event"))?;
+/// ```
+pub trait ResultExt<T> {
+    fn with_error_context(self, ctx: ErrorContext) -> Result<T, AppError>;
+}
+
+impl<T> ResultExt<T> for Result<T, AppError> {
+    fn with_error_context(self, ctx: ErrorContext) -> Result<T, AppError> {
+        self.map_err(|e| e.with_context(ctx))
+    }
+}
+
+/// Map a `String` error to a standardized `AppError::validation`.
+/// Replaces repetitive `map_err(|_| AppError::Validation("...".to_string()))` patterns.
+pub fn map_validation<T>(msg: impl Into<String>) -> impl FnOnce() -> AppError {
+    move || AppError::validation(msg.clone().into())
+}
+
+/// Map a serialization/deserialization error to a standardized `AppError::internal`.
+pub fn map_serialization_error<T>() -> impl FnOnce() -> AppError {
+    || AppError::internal("serialization error".to_string())
+}
+
+/// Map an I/O error to a standardized `AppError::internal`.
+pub fn map_io_error<T>() -> impl FnOnce() -> AppError {
+    || AppError::internal("I/O error".to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Error documentation generator — Issue #992
+// ---------------------------------------------------------------------------
+
+/// Generates a markdown documentation string for all [`AppError`] variants.
+/// Used to produce `docs/error-handling.md`.
+pub fn generate_error_docs() -> String {
+    let mut doc = String::from("# Error Handling Documentation\n\n");
+    doc.push_str("## AppError Variants\n\n");
+    doc.push_str("| Variant | HTTP Status | Code | Description |\n");
+    doc.push_str("|---------|-------------|------|-------------|\n");
+    doc.push_str("| `NotFound` | 404 | NOT_FOUND | Resource not found |\n");
+    doc.push_str("| `Validation(msg)` | 400 | VALIDATION_ERROR | Invalid input provided |\n");
+    doc.push_str("| `ValidationWithDetails(msg, errors)` | 400 | VALIDATION_ERROR | Validation with field details |\n");
+    doc.push_str("| `Forbidden(msg)` | 403 | FORBIDDEN | Access denied |\n");
+    doc.push_str("| `CallbackUrlNotAllowed(msg)` | 400 | CALLBACK_URL_NOT_ALLOWED | Callback URL domain not in allowlist |\n");
+    doc.push_str("| `Auth(AuthError::Unauthenticated)` | 401 | UNAUTHORIZED | Missing or invalid credentials |\n");
+    doc.push_str("| `Auth(AuthError::TokenExpired)` | 401 | UNAUTHORIZED | Authentication token expired |\n");
+    doc.push_str("| `Database(sqlx::Error)` | 500 | DATABASE_ERROR | Database operation failed |\n");
+    doc.push_str("| `DatabaseDomain(DatabaseError::NotFound)` | 404 | NOT_FOUND | Record not found in database |\n");
+    doc.push_str("| `DatabaseDomain(DatabaseError::Timeout)` | 503 | DATABASE_TIMEOUT | Query timed out |\n");
+    doc.push_str("| `DatabaseDomain(DatabaseError::PoolExhausted)` | 503 | DATABASE_POOL_EXHAUSTED | Connection pool exhausted |\n");
+    doc.push_str("| `Rpc(RpcError::RateLimited)` | 429 | UPSTREAM_RATE_LIMITED | Upstream rate limit exceeded |\n");
+    doc.push_str("| `Indexer(IndexerError::LockNotAcquired)` | 503 | INDEXER_LOCK_NOT_ACQUIRED | Advisory lock not acquired |\n");
+    doc.push_str("| `Indexer(IndexerError::Stalled)` | 503 | INDEXER_STALLED | Indexer has stalled |\n");
+    doc.push_str("| `Webhook(WebhookError::InvalidEndpoint)` | 400 | INVALID_WEBHOOK_ENDPOINT | Invalid webhook URL |\n");
+    doc.push_str("| `Webhook(WebhookError::SignatureMismatch)` | 401 | WEBHOOK_SIGNATURE_MISMATCH | HMAC signature mismatch |\n");
+    doc.push_str("| `Subscription(SubscriptionError::NotFound)` | 404 | NOT_FOUND | Subscription not found |\n");
+    doc.push_str("| `Subscription(SubscriptionError::LimitExceeded)` | 429 | SUBSCRIPTION_LIMIT_EXCEEDED | Subscription limit exceeded |\n");
+    doc.push_str("| `WithContext { .. }` | Inherits source | Inherits source | Error with context metadata |\n\n");
+    doc.push_str("## ErrorContext\n\n");
+    doc.push_str("Attach structured metadata to any error using [`ErrorContext`]:\n\n");
+    doc.push_str("```rust\n");
+    doc.push_str("use crate::error::{AppError, ErrorContext};\n");
+    doc.push_str("Err(AppError::not_found().with_context(\n");
+    doc.push_str("    ErrorContext::new().with_operation(\"get_event\").with_entity(\"event:abc\"),\n");
+    doc.push_str("))?\n");
+    doc.push_str("```\n\n");
+    doc.push_str("## Recovery Suggestions\n\n");
+    doc.push_str("Use [`ErrorRecovery`] to provide actionable guidance:\n\n");
+    doc.push_str("```rust\n");
+    doc.push_str("use crate::error::ErrorRecovery;\n");
+    doc.push_str("let recovery = ErrorRecovery::new(\"Check your API key and try again\")\n");
+    doc.push_str("    .with_doc(\"https://docs.example.com/api-keys\");\n");
+    doc.push_str("```\n");
+    doc
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn not_found_maps_to_404() {
+        assert_eq!(
+            AppError::NotFound.status_and_code(),
+            (StatusCode::NOT_FOUND, "NOT_FOUND")
+        );
+    }
+
+    #[test]
+    fn validation_maps_to_400() {
+        assert_eq!(
+            AppError::Validation("bad input".into()).status_and_code(),
+            (StatusCode::BAD_REQUEST, "VALIDATION_ERROR")
+        );
+    }
+
+    #[test]
+    fn forbidden_maps_to_403() {
+        assert_eq!(
+            AppError::Forbidden("nope".into()).status_and_code(),
+            (StatusCode::FORBIDDEN, "FORBIDDEN")
+        );
+    }
+
+    #[test]
+    fn internal_maps_to_500() {
+        assert_eq!(
+            AppError::Internal("oops".into()).status_and_code(),
+            (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR")
+        );
+    }
+
+    #[test]
+    fn domain_db_not_found_maps_to_404() {
+        let e: AppError = DatabaseError::NotFound("event:123".into()).into();
+        assert_eq!(e.status_and_code(), (StatusCode::NOT_FOUND, "NOT_FOUND"));
+    }
+
+    #[test]
+    fn domain_db_timeout_maps_to_503() {
+        let e: AppError = DatabaseError::Timeout.into();
+        assert_eq!(
+            e.status_and_code(),
+            (StatusCode::SERVICE_UNAVAILABLE, "DATABASE_TIMEOUT")
+        );
+    }
+
+    #[test]
+    fn auth_unauthenticated_maps_to_401() {
+        let e: AppError = AuthError::Unauthenticated.into();
+        assert_eq!(
+            e.status_and_code(),
+            (StatusCode::UNAUTHORIZED, "UNAUTHORIZED")
+        );
+    }
+
+    #[test]
+    fn context_wrapping_preserves_status() {
+        let e = AppError::NotFound.with_context(
+            ErrorContext::new()
+                .with_operation("fetch_event")
+                .with_entity("event:abc"),
+        );
+        assert_eq!(e.status_and_code(), (StatusCode::NOT_FOUND, "NOT_FOUND"));
+    }
+
+    #[test]
+    fn result_ext_works() {
+        let result: Result<(), AppError> = Err(AppError::NotFound);
+        let wrapped = result.with_error_context(
+            ErrorContext::new().with_operation("test_op"),
+        );
+        assert!(matches!(wrapped, Err(AppError::WithContext { .. })));
+    }
+
+    #[test]
+    fn subscription_limit_maps_to_429() {
+        let e: AppError = SubscriptionError::LimitExceeded.into();
+        assert_eq!(
+            e.status_and_code(),
+            (StatusCode::TOO_MANY_REQUESTS, "SUBSCRIPTION_LIMIT_EXCEEDED")
+        );
+    }
+
+    #[test]
+    fn rpc_rate_limited_maps_to_429() {
+        let e = AppError::Rpc(RpcError::RateLimited);
+        assert_eq!(
+            e.status_and_code(),
+            (StatusCode::TOO_MANY_REQUESTS, "UPSTREAM_RATE_LIMITED")
+        );
+    }
+
+    #[test]
+    fn webhook_signature_mismatch_maps_to_401() {
+        let e: AppError = WebhookError::SignatureMismatch.into();
+        assert_eq!(
+            e.status_and_code(),
+            (StatusCode::UNAUTHORIZED, "WEBHOOK_SIGNATURE_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn set_and_get_request_id() {
+        set_request_id("test-id-123".to_string());
+        assert_eq!(get_request_id(), "test-id-123");
+        // Clean up
+        REQUEST_ID.with(|r| *r.borrow_mut() = None);
+    }
+
+    // Issue #992: Standardized constructors tests
+
+    #[test]
+    fn validation_constructor_works() {
+        let e = AppError::validation("bad input");
+        assert_eq!(e.status_and_code(), (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"));
+    }
+
+    #[test]
+    fn internal_constructor_works() {
+        let e = AppError::internal("oops");
+        assert_eq!(e.status_and_code(), (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"));
+    }
+
+    #[test]
+    fn not_found_constructor_works() {
+        let e = AppError::not_found();
+        assert_eq!(e.status_and_code(), (StatusCode::NOT_FOUND, "NOT_FOUND"));
+    }
+
+    #[test]
+    fn forbidden_constructor_works() {
+        let e = AppError::forbidden("denied");
+        assert_eq!(e.status_and_code(), (StatusCode::FORBIDDEN, "FORBIDDEN"));
+    }
+
+    #[test]
+    fn callback_url_not_allowed_maps_to_400() {
+        let e = AppError::callback_url_not_allowed("domain not allowed");
+        assert_eq!(
+            e.status_and_code(),
+            (StatusCode::BAD_REQUEST, "CALLBACK_URL_NOT_ALLOWED")
+        );
+    }
+
+    #[test]
+    fn unauthorized_constructor_works() {
+        let e = AppError::unauthorized();
+        assert_eq!(e.status_and_code(), (StatusCode::UNAUTHORIZED, "UNAUTHORIZED"));
+    }
+
+    #[test]
+    fn rate_limited_constructor_works() {
+        let e = AppError::rate_limited();
+        assert_eq!(e.status_and_code(), (StatusCode::TOO_MANY_REQUESTS, "SUBSCRIPTION_LIMIT_EXCEEDED"));
+    }
+
+    #[test]
+    fn error_recovery_works() {
+        let recovery = ErrorRecovery::new("Try again")
+            .with_doc("https://docs.example.com");
+        assert_eq!(recovery.suggestion, "Try again");
+        assert_eq!(recovery.doc_link, Some("https://docs.example.com".to_string()));
+    }
+
+    #[test]
+    fn generate_error_docs_is_nonempty() {
+        let docs = generate_error_docs();
+        assert!(docs.contains("AppError Variants"));
+        assert!(docs.contains("ErrorContext"));
+    }
+
+    // Issue #1265: RFC 9457 Problem Details
+
+    #[test]
+    fn problem_detail_type_uri_is_documented_uri() {
+        assert_eq!(
+            ProblemDetail::type_uri_for_code("NOT_FOUND"),
+            "https://sorobanpulse.dev/errors/not_found"
+        );
+    }
+
+    #[test]
+    fn problem_detail_title_from_code() {
+        assert_eq!(
+            ProblemDetail::title_for_code("VALIDATION_ERROR"),
+            "Validation Error"
+        );
+        assert_eq!(ProblemDetail::title_for_code("NOT_FOUND"), "Not Found");
+    }
+
+    #[test]
+    fn problem_detail_serialises_rfc9457_fields() {
+        let problem = AppError::NotFound.to_problem_detail(Some("/v1/events/1".to_string()));
+        let value = serde_json::to_value(&problem).unwrap();
+        assert_eq!(value["type"], "https://sorobanpulse.dev/errors/not_found");
+        assert_eq!(value["title"], "Not Found");
+        assert_eq!(value["status"], 404);
+        assert_eq!(value["instance"], "/v1/events/1");
+        assert!(value.get("detail").is_some());
+    }
+
+    #[test]
+    fn into_response_sets_problem_json_content_type() {
+        let response = AppError::Validation("bad".into()).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/problem+json"
+        );
+    }
 }

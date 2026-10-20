@@ -30,6 +30,16 @@ use sha2::{Digest, Sha256};
 /// The fingerprint covers all semantically meaningful fields so that two events
 /// with identical on-chain content produce the same hex string, even if they
 /// were delivered with different tx_hashes across retry attempts.
+///
+/// NOTE: `tx_hash` is currently included in the hashed input (see below), which
+/// means two events that differ *only* in `tx_hash` — the exact "different
+/// tx_hash, same content" retry scenario this module's guarantees describe —
+/// produce *different* fingerprints and are NOT caught by this layer. See
+/// `different_tx_hash_produces_different_fingerprint` in this module's test
+/// suite, which asserts that behavior directly. The DB unique constraint on
+/// `(tx_hash, contract_id, event_type)` still catches exact tx_hash repeats;
+/// this discrepancy only affects the same-content-different-tx_hash case
+/// called out in docs/event-deduplication.md.
 pub fn compute_fingerprint(
     tx_hash: &str,
     contract_id: &str,

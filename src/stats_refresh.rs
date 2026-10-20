@@ -171,6 +171,29 @@ pub async fn check_staleness(pool: &PgPool) {
     }
 }
 
+/// Update the per-contract event count Prometheus gauges for the Grafana
+/// "Contract Popularity Top-10" panel (#695). Reads from `events_contract_summary`.
+pub async fn update_contract_event_count_metrics(pool: &PgPool) {
+    let mut conn = match pool.acquire().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to acquire DB connection for contract metrics");
+            return;
+        }
+    };
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT contract_id, event_count FROM events_contract_summary ORDER BY event_count DESC LIMIT 20",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .unwrap_or_default();
+
+    for (contract_id, count) in rows {
+        crate::metrics::update_contract_event_count(&contract_id, count);
+    }
+}
+
 /// Run EXPLAIN on a representative events query and record estimated row count.
 pub async fn analyze_query_plans(pool: &PgPool) {
     let queries: &[(&str, &str)] = &[
@@ -214,19 +237,21 @@ pub async fn analyze_query_plans(pool: &PgPool) {
 
 /// Spawn a background task that refreshes the materialized views every `interval_secs` seconds.
 /// Also runs staleness checks and query-plan analysis on each cycle.
-pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<bool>) {
+pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let interval = Duration::from_secs(interval_secs);
         // Initial refresh on startup
         refresh_all(&pool).await;
         check_staleness(&pool).await;
         analyze_query_plans(&pool).await;
+        update_contract_event_count_metrics(&pool).await;
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {
                     refresh_all(&pool).await;
                     check_staleness(&pool).await;
                     analyze_query_plans(&pool).await;
+                    update_contract_event_count_metrics(&pool).await;
                 }
                 _ = shutdown.changed() => {
                     info!("Stats refresh task shutting down");
@@ -234,7 +259,7 @@ pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown: watch::Receiver<boo
                 }
             }
         }
-    });
+    })
 }
 
 // ---------------------------------------------------------------------------

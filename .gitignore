@@ -33,6 +33,8 @@ backups/
 **/__snapshots__/
 **/snapshots/
 **/snapshots/*.snap.new
+**/test-snapshots/
+**/test_snapshots/
 
 # mdBook generated output — never commit the built site
 book/
@@ -82,8 +84,15 @@ ngrok
 
 # Implementation summary / session artefacts
 IMPLEMENTATION_SUMMARY.md
+IMPLEMENTATION_SUMMARY_*.md
+IMPLEMENTATION_STATUS.md
 IMPLEMENTATION_COMPLETE.md
+INTEGRATIONS_IMPLEMENTATION.md
 SDK_IMPLEMENTATION_SUMMARY.md
+IMPLEMENTATION_STATUS.md
+IMPLEMENTATION_SUMMARY_*.md
+INTEGRATIONS_IMPLEMENTATION.md
+INTEGRATION_GUIDE.md
 validate_implementation.ps1
 test_email_feature.sh
 q-dev-chat-*.md
@@ -113,3 +122,32 @@ terraform/**/terraform.tfstate.backup
 # Never commit actual tfvars (may contain secrets)
 terraform.tfvars
 **/terraform.tfvars
+
+# Test parallelization cache
+.test-cache/
+test-results/
+*.test-result.json
+
+# DSL compiled artifacts
+*.dsl.compiled
+
+# Batch operation temp files
+batch-*.tmp
+
+# Filter DSL schema cache
+filter_dsl_schema_cache.json
+
+# Parallel test worker databases (local dev)
+test_schemas/
+
+# Test parallelization temp output
+tests/parallel_output/
+
+# jsonschema generated artefacts
+*.jsonschema.out
+
+# Docs site (Docusaurus) build output
+docs/site/node_modules/
+docs/site/build/
+docs/site/.docusaurus/
+docs/site/static/openapi.json

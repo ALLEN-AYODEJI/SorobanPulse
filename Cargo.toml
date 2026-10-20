@@ -1,133 +1,112 @@
 [package]
 name = "soroban-pulse"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+authors = ["SorobanPulse Team"]
+description = "Real-time event streaming and observability platform for Soroban/Stellar blockchain"
+license = "MIT"
+repository = "https://github.com/Soroban-Pulse/SorobanPulse"
 
 [dependencies]
-axum = { version = "0.8", features = ["macros", "ws"] }
-tokio = { version = "1", features = ["full"] }
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "json", "migrate"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-regex = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-opentelemetry = { version = "0.22", optional = true }
-opentelemetry = { version = "0.21", optional = true }
-opentelemetry-otlp = { version = "0.14", optional = true }
-opentelemetry_sdk = { version = "0.21", optional = true }
-dotenvy = "0.15"
-toml = "0.8"
-thiserror = "1"
-utoipa = { version = "4", features = ["axum_extras", "uuid", "chrono"] }
-anyhow = "1"
+# Web framework
+actix-web = "4.4"
+actix-rt = "2.9"
+actix-cors = "0.7"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
-url = "2"
-tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.5", features = ["trace", "cors", "compression-full", "metrics", "request-id", "limit"] }
-metrics = "0.22"
-metrics-exporter-prometheus = "0.14"
-axum-extra = { version = "0.9", features = ["typed-header"] }
 async-trait = "0.1"
-tower_governor = { version = "0.8", features = ["axum"] }
-# Token-bucket rate limiting for per-channel notification throttling (Issue #476).
-governor = "0.10"
-base64 = "0.22"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json", "macros"] }
+diesel = { version = "2.1", features = ["postgres", "uuid", "chrono", "serde_json"], optional = true }
+
+# Cryptography - Classical
+ed25519-dalek = "2.1"
 sha2 = "0.10"
 hmac = "0.12"
-hex = "0.4"
-subtle = "2.5"
-aes-gcm = { version = "0.10", optional = true }
-rand = { version = "0.8", optional = true }
+subtle = "2.6"
+aes-gcm = "0.10"
 
-# Issue #267: XDR validation
-stellar-xdr = { version = "26", features = ["std", "curr", "serde"] }
+# Cryptography - Post-Quantum (optional feature)
+pqcrypto-dilithium = { version = "0.5", optional = true }
+pqcrypto-kyber = { version = "0.8", optional = true }
+pqcrypto-falcon = { version = "0.3", optional = true }
+pqcrypto-sphincsplus = { version = "0.7", optional = true }
+pqcrypto-traits = { version = "0.3", optional = true }
 
-# Issue #266: Bloom filter deduplication
-bloomfilter = "3"
+# Time and dates
+chrono = { version = "0.4", features = ["serde"] }
+time = "0.3"
 
-# Issue #268: Contract count cache
-moka = { version = "0.12", features = ["future"] }
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-opentelemetry = { version = "0.22", optional = true }
+opentelemetry = { version = "0.21", features = ["trace", "metrics"] }
+opentelemetry-otlp = "0.14"
+opentelemetry-jaeger = { version = "0.20", optional = true }
 
-# Issue #453: Per-IP SSE connection tracking
-dashmap = "5"
+# Metrics
+prometheus = "0.13"
+metrics = "0.21"
 
-# Issue #367: Zeroizing secrets
-secrecy = { version = "0.8", features = ["serde"] }
+# Configuration
+config = "0.13"
+dotenv = "0.15"
 
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
 
-# Issue #265: AWS Kinesis streaming (optional, behind kinesis feature flag)
-aws-sdk-kinesis = { version = "1", optional = true }
-aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
+# UUID
+uuid = { version = "1.6", features = ["serde", "v4"] }
 
-# Issue #264: GCP Pub/Sub streaming (optional, behind pubsub feature flag)
-google-cloud-pubsub = { version = "0.33", optional = true }
+# HTTP client
+reqwest = { version = "0.11", features = ["json", "stream"] }
 
-# Email notifications
-lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "dkim"] }
+# GraphQL
+async-graphql = "7.0"
+async-graphql-actix-web = "7.0"
 
-# DNS resolver for SPF record checks (Issue #486)
-hickory-resolver = "0.24"
-
-# Issue #480 & #482: Multi-language and HTML email notification templates (Handlebars)
-handlebars = "5"
-
-# Issue #479: cron expression parsing for custom notification schedules
-cron = "0.12"
-
-# JSON Schema validation
-jsonschema = "0.18"
-
-# Issue #XXX: Lua scripting for event transformation (optional, behind lua feature flag)
-mlua = { version = "0.9", features = ["lua54", "async", "serialize"], optional = true }
-
-# Issue #683: GraphQL API layer
-async-graphql = { version = "0.12", features = ["chrono", "uuid"] }
-async-graphql-axum = "0.2"
+# WebSocket
 tokio-tungstenite = "0.21"
 
-[features]
-default = []
-otel = ["dep:tracing-opentelemetry", "dep:opentelemetry", "dep:opentelemetry-otlp", "dep:opentelemetry_sdk"]
-zipkin = ["dep:opentelemetry", "dep:opentelemetry-zipkin", "dep:opentelemetry_sdk"]
-encryption = ["dep:aes-gcm", "dep:rand"]
-kinesis = ["dep:aws-sdk-kinesis", "dep:aws-config"]
-sqs = []
-pubsub = ["dep:google-cloud-pubsub"]
-archive = []
-lua = ["dep:mlua"]
+# Utilities
+bytes = "1.5"
+base64 = "0.21"
+hex = "0.4"
+stellar-xdr = { version = "22", features = ["curr", "serde", "base64"] }
+regex = "1"
+blake3 = "1"
+toml = "0.8"
+secrecy = "0.5"
+rand = "0.8"
+
+# HTTP middleware / static files (the `fs` feature is enabled by `dashboard`)
+tower-http = { version = "0.5", features = ["trace", "cors", "compression-full", "metrics", "request-id", "limit"] }
+
+# Service mesh integration
+tonic = { version = "0.10", optional = true }
+prost = { version = "0.12", optional = true }
+
+# Messaging integrations (optional, enabled per-deployment)
+rdkafka = { version = "0.36", features = ["cmake-build"], optional = true }
+google-cloud-pubsub = { version = "0.33", optional = true }
+google-cloud-googleapis = { version = "0.16", optional = true }
+url = { version = "2.5" }
 
 [dev-dependencies]
-sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "chrono", "uuid", "json", "migrate"] }
-async-trait = "0.1"
 criterion = { version = "0.5", features = ["html_reports"] }
-# Issue #554: Property-based testing
-proptest = "1"
-
-[dependencies.flate2]
-version = "1"
-
-[dependencies.tempfile]
-version = "3"
-
-[dependencies.http-body-util]
-version = "0.1"
-
-[dependencies.parquet]
-version = "53"
-default-features = false
-features = ["snap"]
-
-[dependencies.arrow-array]
-version = "53"
-
-[dependencies.opentelemetry-zipkin]
-version = "0.19"
-optional = true
+proptest = "1.4"
+mockall = "0.12"
+wiremock = "0.6"
+insta = "1"
 
 [[bin]]
 name = "gen_env_docs"
@@ -136,23 +115,67 @@ path = "src/bin/gen_env_docs.rs"
 [[bin]]
 name = "gen_postman"
 path = "src/bin/gen_postman.rs"
+[features]
+default = ["classical-crypto", "dashboard"]
+
+# Issue #1112: serve the built web dashboard at /ui (runtime opt-in: SERVE_DASHBOARD=true).
+# Build with --no-default-features --features classical-crypto to drop it.
+dashboard = ["tower-http/fs"]
+
+# Cryptography features
+classical-crypto = []
+quantum-crypto = [
+    "pqcrypto-dilithium",
+    "pqcrypto-kyber",
+    "pqcrypto-falcon",
+    "pqcrypto-sphincsplus",
+    "pqcrypto-traits"
+]
+hybrid-crypto = ["classical-crypto", "quantum-crypto"]
+
+# Service mesh features
+istio = ["tonic", "prost"]
+linkerd = ["tonic", "prost"]
+
+# Observability features
+full-observability = ["tracing-opentelemetry", "opentelemetry-jaeger"]
+
+# Messaging integrations
+kafka = ["dep:rdkafka"]
+sqs = []
+pubsub = ["dep:google-cloud-pubsub", "dep:google-cloud-googleapis"]
+
+# Chaos testing (gates tests/chaos_tests.rs advisory-lock failover tests)
+chaos = []
+
+[lints.clippy]
+# Lint policy — replaces the crate-level #![deny]/#![allow] that used to live
+# in src/main.rs. Keeping it here makes the configuration visible and applies
+# consistently to both the library and binary targets.
+all = "deny"
+pedantic = "deny"
+# AppError, AppState, etc. — repeating the module name is idiomatic in Rust.
+module_name_repetitions = "allow"
+# Internal service; these are not public library APIs.
+missing_errors_doc = "allow"
+# Panics only occur on misconfiguration at startup.
+missing_panics_doc = "allow"
+# Used sparingly in test modules only.
+wildcard_imports = "allow"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+
+[lib]
+name = "soroban_pulse"
+path = "src/lib.rs"
 
 [[bin]]
-name = "gen_subscription_scaffold"
-path = "src/bin/gen_subscription_scaffold.rs"
-
-[[bench]]
-name = "pagination"
-harness = false
-
-[[bench]]
-name = "db_queries"
-harness = false
-
-[[bench]]
-name = "compression"
-harness = false
-
-[[bench]]
-name = "conditional_get"
-harness = false
+name = "soroban-pulse"
+path = "src/main.rs"

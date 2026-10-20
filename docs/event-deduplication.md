@@ -54,6 +54,23 @@ The JSON serialisation of `event_data` uses `serde_json::Value::to_string()` (ca
 | Same event with a different tx_hash (`ENABLE_CONTENT_DEDUP=false`) | **Not** deduplicated — stored as a new row |
 | Different event, same tx_hash prefix collision | Not deduplicated (different `(tx_hash, contract_id, event_type)` tuple) |
 
+> **Known discrepancy:** `compute_fingerprint` currently hashes `tx_hash` as
+> part of its input (see `src/dedup.rs`), so two events differing *only* in
+> `tx_hash` produce *different* fingerprints — the row above describing that
+> case as "deduplicated by fingerprint check" does not currently hold. The
+> unit test `different_tx_hash_produces_different_fingerprint` in
+> `src/dedup.rs` demonstrates this directly. Fixing it (dropping `tx_hash`
+> from the hashed input) is a deliberate behavior change best made as its
+> own reviewed PR rather than folded into unrelated work.
+
+## Testing
+
+`compute_fingerprint` has unit tests in `src/dedup.rs`. The DB-backed half
+of the guard, `is_content_duplicate`, is covered by
+`tests/dedup_content_fingerprint_tests.rs`: a fresh matching fingerprint,
+a non-matching fingerprint, and both sides of the `dedup_window_secs`
+lookback boundary.
+
 ## Metrics
 
 | Metric | Description |

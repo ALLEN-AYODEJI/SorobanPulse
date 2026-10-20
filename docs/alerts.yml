@@ -225,6 +225,63 @@ groups:
           description: "pg_stat_replication shows zero connected replicas. Read queries may be served from the primary only. Investigate replica health."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/replica-monitoring.md"
 
+      # ── SLO error-budget alerts (Google SRE multi-window burn-rate guidance) ───────
+      # The /v1/admin/slo/report endpoint exposes the same numbers as JSON.
+      - alert: SLOBudgetBurnRateFast
+        expr: soroban_pulse_slo_burn_rate > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          component: slo
+        annotations:
+          summary: "SLO error budget is burning fast (>14.4x)"
+          description: "SLO {{ $labels.slo }} has a burn rate of {{ $value }} over the last window. At this rate the 30-day error budget will be exhausted in ~2h. Page on-call immediately."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/sli-slo.md"
+
+      - alert: SLOBudgetBurnRateSlow
+        expr: soroban_pulse_slo_burn_rate > 6
+        for: 5m
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "SLO error budget is burning too fast (>6x)"
+          description: "SLO {{ $labels.slo }} has a burn rate of {{ $value }} over the last window. At this rate the 30-day error budget will be exhausted in ~5h. Investigate."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/sli-slo.md"
+
+      - alert: SLOErrorBudgetLow
+        expr: soroban_pulse_slo_error_budget_remaining < 0.1
+        for: 10m
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "SLO error budget is nearly exhausted"
+          description: "SLO {{ $labels.slo }} has only {{ $value | humanizePercentage }} of its error budget remaining. Freeze risky deploys until the budget recovers."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/sli-slo.md"
+
+      - alert: SLOCompletionBelowTarget
+        expr: soroban_pulse_slo_completion_ratio < 0.95
+        for: 15m
+        labels:
+          severity: warning
+          component: slo
+        annotations:
+          summary: "SLO completion ratio below 95%"
+          description: "SLO {{ $labels.slo }} completion ratio is {{ $value | humanizePercentage }} over the rolling window. Investigate before budget exhaustion."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/sli-slo.md"
+
+      - alert: SLOSeverelyBreached
+        expr: soroban_pulse_slo_completion_ratio < 0.5
+        for: 5m
+        labels:
+          severity: critical
+          component: slo
+        annotations:
+          summary: "SLO completion ratio below 50%"
+          description: "SLO {{ $labels.slo }} completion ratio is {{ $value | humanizePercentage }}. Treat as a customer-impacting incident."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/sli-slo.md"
+
       # #587: Feature flag rollback automation alerts
       - alert: FeatureFlagAutoRollback
         expr: increase(soroban_pulse_feature_flag_rollback_total[5m]) > 0
@@ -247,3 +304,26 @@ groups:
           summary: "Error rate approaching feature flag rollback threshold"
           description: "Current error rate is {{ $value | humanizePercentage }} (rollback threshold 5%). Feature flags with auto_rollback enabled may be disabled soon."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/feature-flag-rollback.md"
+
+      # #1263: Incident correlation alerts
+      - alert: IncidentsOpen
+        expr: soroban_pulse_incidents_open > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: incident_correlation
+        annotations:
+          summary: "Soroban Pulse has open correlated incidents"
+          description: "{{ $value }} incident(s) remain open for more than 5 minutes. Correlated anomaly alerts, RPC errors, and indexer lag have been grouped into incidents. Review them via GET /v1/admin/incidents and investigate the underlying signals."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/incident-correlation.md"
+
+      - alert: IncidentCreationSpike
+        expr: increase(soroban_pulse_incidents_created_total[10m]) >= 3
+        for: 0m
+        labels:
+          severity: critical
+          component: incident_correlation
+        annotations:
+          summary: "Multiple correlated incidents created in a short window"
+          description: "{{ $value }} incident(s) were created in the last 10 minutes, indicating a burst of correlated anomaly events (RPC errors, indexer lag, or anomaly alerts). Check GET /v1/admin/incidents and the indexer/RPC health dashboards."
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/incident-correlation.md"
