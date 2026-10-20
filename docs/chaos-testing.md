@@ -6,7 +6,7 @@ Chaos tests verify that Soroban Pulse degrades gracefully — and recovers — w
 its dependencies misbehave: the Stellar RPC endpoint returns errors or hangs,
 the database is under lock contention, or the indexer stalls entirely. The
 goal is not to find new bugs on every run (that's what fuzzing and property
-tests are for — see [property-testing.md](property-testing.md)) but to pin
+tests are for — see [property-based-testing.md](property-based-testing.md)) but to pin
 down *known* failure/recovery contracts so a future change can't silently
 break them.
 

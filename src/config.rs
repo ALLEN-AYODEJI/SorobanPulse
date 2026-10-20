@@ -5,6 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use url::Url;
 use secrecy::SecretString;
 
+pub mod reference;
+
 /// Load an optional TOML config file. Returns an empty table if the file is
 /// absent or CONFIG_FILE is not set — never an error.
 fn load_config_file() -> toml::Table {
@@ -256,6 +258,11 @@ pub struct Config {
     pub rpc_request_timeout_secs: u64,
     pub allowed_origins: Vec<String>,
     pub rate_limit_per_minute: u32,
+    /// Per-IP rate limit for `POST /v1/subscriptions` (Issue #1268).
+    /// Stricter than the global `rate_limit_per_minute` to prevent DB
+    /// connection exhaustion via subscription spam. Set via
+    /// SUBSCRIPTION_RATE_LIMIT_PER_MINUTE (default 5).
+    pub subscription_rate_limit_per_minute: u32,
     /// Per-API-key rate limit: max requests per minute (Issue #669).
     /// When set, each API key gets its own sliding-window quota stored in the
     /// `rate_limit_counters` table. `None` disables per-key enforcement.
@@ -407,7 +414,7 @@ pub struct Config {
     // Issue #325: SSE Last-Event-ID replay limit
     pub sse_replay_limit: u64,
     // Issue #454: SSE_REPLAY_MAX_EVENTS (alias for sse_replay_limit, read from SSE_REPLAY_MAX_EVENTS env var)
-    // Issue #453: Per-IP SSE connection limit
+    // Issue #453 / #1268: Per-IP SSE connection limit
     pub sse_max_connections_per_ip: usize,
     // Issue #451: Max lag before disconnect
     pub sse_max_lag_before_disconnect: u64,
@@ -561,6 +568,26 @@ pub struct Config {
     /// Deployment role: controls which subsystems start on this instance.
     /// Set via `ROLE=all|api|indexer`. Default: `all` (backward-compatible).
     pub role: Role,
+
+    // Issue #1262: derived metrics DSL
+    /// Path to a YAML file containing user-defined derived metric definitions.
+    /// Set via DERIVED_METRICS_CONFIG. When unset, no derived metrics run.
+    pub derived_metrics_config_path: Option<String>,
+    /// Inline derived metric definitions (YAML string), used when
+    /// DERIVED_METRICS_CONFIG is not set. Set via DERIVED_METRICS_INLINE.
+    pub derived_metrics_inline: Option<String>,
+    /// How often the derived metrics background job evaluates metrics (seconds).
+    /// Set via DERIVED_METRICS_INTERVAL_SECS. Default: 60.
+    pub derived_metrics_interval_secs: u64,
+
+    // Issue #1263: incident correlation engine
+    /// Sliding window (seconds) within which correlated signals are grouped
+    /// into a single incident. Set via CORRELATION_WINDOW_SECS.
+    /// Default: 300, clamped to [60, 3600].
+    pub correlation_window_secs: u64,
+    /// How often the incident detector evaluates correlation rules (seconds).
+    /// Set via INCIDENT_DETECTOR_INTERVAL_SECS. Default: 30, clamped to [10, 300].
+    pub incident_detector_interval_secs: u64,
 }
 
 impl Default for Config {
@@ -586,6 +613,7 @@ impl Default for Config {
             rpc_request_timeout_secs: 30,
             allowed_origins: vec!["*".to_string()],
             rate_limit_per_minute: 60,
+            subscription_rate_limit_per_minute: 5,
             rate_limit_key_per_minute: None,
             rate_limit_key_per_hour: None,
             rate_limit_key_per_day: None,
@@ -661,7 +689,7 @@ impl Default for Config {
             retention_days: 90,
             pruning_interval_hours: 24,
             sse_replay_limit: 1000,
-            sse_max_connections_per_ip: 10,
+            sse_max_connections_per_ip: 5,
             sse_max_lag_before_disconnect: 0, // 0 = disabled
             indexer_ignore_checkpoint: false,
             webhook_require_https: false,
@@ -740,6 +768,11 @@ impl Default for Config {
             ml_confidence_threshold: 0.8,
             ml_auto_retrain: true,
             role: Role::All,
+            derived_metrics_config_path: None,
+            derived_metrics_inline: None,
+            derived_metrics_interval_secs: 60,
+            correlation_window_secs: 300,
+            incident_detector_interval_secs: 30,
         }
     }
 }
@@ -1273,6 +1306,17 @@ impl Config {
         )
         .unwrap_or(60);
 
+        // Issue #1268: stricter per-IP limit for POST /v1/subscriptions.
+        let subscription_rate_limit_per_minute = parse_int_range::<u32>(
+            "SUBSCRIPTION_RATE_LIMIT_PER_MINUTE",
+            &env_or_file_or("SUBSCRIPTION_RATE_LIMIT_PER_MINUTE", &file, "5"),
+            1,
+            u32::MAX,
+            "5",
+            &mut errors,
+        )
+        .unwrap_or(5);
+
         // Issue #669 / #666: Per-API-key rate limits (optional, sliding window).
         let rate_limit_key_per_minute = env_or_file("RATE_LIMIT_KEY_PER_MINUTE", &file)
             .and_then(|v| parse_int::<u32>("RATE_LIMIT_KEY_PER_MINUTE", &v, "1000", &mut errors))
@@ -1374,6 +1418,17 @@ impl Config {
             &mut errors,
         )
         .unwrap_or(1000);
+
+        // Issue #1268: per-IP SSE connection limit.
+        let sse_max_connections_per_ip = parse_int_range::<usize>(
+            "SSE_MAX_CONNECTIONS_PER_IP",
+            &env_or_file_or("SSE_MAX_CONNECTIONS_PER_IP", &file, "5"),
+            1,
+            usize::MAX,
+            "5",
+            &mut errors,
+        )
+        .unwrap_or(5);
 
         let sse_drain_timeout_secs = parse_int_range::<u64>(
             "SSE_DRAIN_TIMEOUT_SECS",
@@ -1516,6 +1571,72 @@ impl Config {
         let rpc_headers = parse_rpc_headers_checked(&mut errors);
         let indexer_event_types = parse_indexer_event_types_checked(&mut errors);
 
+        // Issue #1262: derived metrics DSL configuration.
+        let derived_metrics_config_path = env_or_file("DERIVED_METRICS_CONFIG", &file)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let derived_metrics_inline = env_or_file("DERIVED_METRICS_INLINE", &file)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let derived_metrics_interval_secs = parse_int_range::<u64>(
+            "DERIVED_METRICS_INTERVAL_SECS",
+            &env_or_file_or("DERIVED_METRICS_INTERVAL_SECS", &file, "60"),
+            10,
+            3600,
+            "60",
+            &mut errors,
+        )
+        .unwrap_or(60);
+
+        // Issue #1263: incident correlation configuration. Out-of-range values
+        // are clamped (with a warning) rather than aborting startup, since a
+        // mis-sized window should not take the whole deployment down.
+        let correlation_window_secs = {
+            let raw = env_or_file_or("CORRELATION_WINDOW_SECS", &file, "300");
+            let parsed = raw.trim().parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %raw,
+                    "CORRELATION_WINDOW_SECS is not a valid integer; using default 300"
+                );
+                300
+            });
+            let clamped = parsed.clamp(60, 3600);
+            if clamped != parsed {
+                tracing::warn!(
+                    value = parsed,
+                    clamped = clamped,
+                    "CORRELATION_WINDOW_SECS out of range [60, 3600]; clamped"
+                );
+            }
+            clamped
+        };
+
+        let incident_detector_interval_secs = {
+            let raw = env_or_file_or("INCIDENT_DETECTOR_INTERVAL_SECS", &file, "30");
+            let parsed = raw.trim().parse::<u64>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    value = %raw,
+                    "INCIDENT_DETECTOR_INTERVAL_SECS is not a valid integer; using default 30"
+                );
+                30
+            });
+            let clamped = parsed.clamp(10, 300);
+            if clamped != parsed {
+                tracing::warn!(
+                    value = parsed,
+                    clamped = clamped,
+                    "INCIDENT_DETECTOR_INTERVAL_SECS out of range [10, 300]; clamped"
+                );
+            }
+            clamped
+        };
+
+        tracing::info!(
+            correlation_window_secs = correlation_window_secs,
+            incident_detector_interval_secs = incident_detector_interval_secs,
+            "incident correlation configuration resolved"
+        );
+
         // Report all errors at once, then exit with code 1 so operators get a
         // clear, deterministic startup failure (a panic would exit with 101).
         if !errors.is_empty() {
@@ -1569,6 +1690,7 @@ impl Config {
             rpc_request_timeout_secs,
             allowed_origins,
             rate_limit_per_minute,
+            subscription_rate_limit_per_minute,
             rate_limit_key_per_minute,
             rate_limit_key_per_hour,
             rate_limit_key_per_day,
@@ -1725,9 +1847,7 @@ impl Config {
                 .or_else(|| env_or_file("SSE_REPLAY_LIMIT", &file))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1000),
-            sse_max_connections_per_ip: env_or_file("SSE_MAX_CONNECTIONS_PER_IP", &file)
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10),
+            sse_max_connections_per_ip,
             sse_max_lag_before_disconnect: env_or_file("SSE_MAX_LAG_BEFORE_DISCONNECT", &file)
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
@@ -1955,6 +2075,11 @@ impl Config {
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or(true),
             role: Role::from_str(&env_or_file_or("ROLE", &file, "all")),
+            derived_metrics_config_path,
+            derived_metrics_inline,
+            derived_metrics_interval_secs,
+            correlation_window_secs,
+            incident_detector_interval_secs,
         }
     }
 }
@@ -2048,6 +2173,62 @@ mod tests {
         assert_eq!(config.start_ledger, 0);
         assert!(!config.start_ledger_fallback);
         assert_eq!(config.environment, Environment::Development);
+        assert_eq!(config.graphql_max_depth, 10);
+        assert_eq!(config.graphql_max_complexity, 1000);
+    }
+
+    #[test]
+    fn graphql_limits_parse_from_env() {
+        env::set_var("GRAPHQL_MAX_DEPTH", "5");
+        env::set_var("GRAPHQL_MAX_COMPLEXITY", "250");
+        let mut errors = Vec::new();
+        let depth = parse_int_range::<usize>(
+            "GRAPHQL_MAX_DEPTH",
+            &env_or_file_or("GRAPHQL_MAX_DEPTH", &load_config_file(), "10"),
+            1,
+            100,
+            "10",
+            &mut errors,
+        );
+        let complexity = parse_int_range::<usize>(
+            "GRAPHQL_MAX_COMPLEXITY",
+            &env_or_file_or("GRAPHQL_MAX_COMPLEXITY", &load_config_file(), "1000"),
+            1,
+            1_000_000,
+            "1000",
+            &mut errors,
+        );
+        env::remove_var("GRAPHQL_MAX_DEPTH");
+        env::remove_var("GRAPHQL_MAX_COMPLEXITY");
+        assert_eq!(depth, Some(5));
+        assert_eq!(complexity, Some(250));
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn graphql_limits_reject_invalid_values() {
+        let mut errors = Vec::new();
+        let depth = parse_int_range::<usize>(
+            "GRAPHQL_MAX_DEPTH",
+            "0",
+            1,
+            100,
+            "10",
+            &mut errors,
+        );
+        let complexity = parse_int_range::<usize>(
+            "GRAPHQL_MAX_COMPLEXITY",
+            "not-a-number",
+            1,
+            1_000_000,
+            "1000",
+            &mut errors,
+        );
+        assert!(depth.is_none());
+        assert!(complexity.is_none());
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("GRAPHQL_MAX_DEPTH"));
+        assert!(errors[1].contains("GRAPHQL_MAX_COMPLEXITY"));
     }
 
     #[test]
@@ -2466,5 +2647,70 @@ mod tests {
         let file = load_config_file();
         assert!(file.is_empty());
         env::remove_var("CONFIG_FILE");
+    }
+
+    // --- Issue #1262: derived metrics config ---
+
+    #[test]
+    fn derived_metrics_defaults() {
+        let config = Config::default();
+        assert!(config.derived_metrics_config_path.is_none());
+        assert!(config.derived_metrics_inline.is_none());
+        assert_eq!(config.derived_metrics_interval_secs, 60);
+    }
+
+    #[test]
+    fn derived_metrics_config_path_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "DERIVED_METRICS_CONFIG = \"/etc/pulse/metrics.yaml\"\n\
+             DERIVED_METRICS_INTERVAL_SECS = \"120\"\n",
+        )
+        .unwrap();
+        env::remove_var("DERIVED_METRICS_CONFIG");
+        env::remove_var("DERIVED_METRICS_INTERVAL_SECS");
+        env::set_var("CONFIG_FILE", path.to_str().unwrap());
+        let file = load_config_file();
+        let cfg_path = env_or_file("DERIVED_METRICS_CONFIG", &file);
+        let interval = env_or_file_or("DERIVED_METRICS_INTERVAL_SECS", &file, "60");
+        env::remove_var("CONFIG_FILE");
+        assert_eq!(cfg_path.as_deref(), Some("/etc/pulse/metrics.yaml"));
+        assert_eq!(interval, "120");
+    }
+
+    // --- Issue #1263: incident correlation config ---
+
+    #[test]
+    fn incident_correlation_defaults() {
+        let config = Config::default();
+        assert_eq!(config.correlation_window_secs, 300);
+        assert_eq!(config.incident_detector_interval_secs, 30);
+    }
+
+    #[test]
+    fn correlation_window_clamps_out_of_range() {
+        // Mirrors the clamping logic in from_env without touching global env.
+        let clamp = |raw: &str| -> u64 {
+            let parsed = raw.trim().parse::<u64>().unwrap_or(300);
+            parsed.clamp(60, 3600)
+        };
+        assert_eq!(clamp("300"), 300);
+        assert_eq!(clamp("10"), 60);
+        assert_eq!(clamp("99999"), 3600);
+        assert_eq!(clamp("not-a-number"), 300);
+    }
+
+    #[test]
+    fn incident_detector_interval_clamps_out_of_range() {
+        let clamp = |raw: &str| -> u64 {
+            let parsed = raw.trim().parse::<u64>().unwrap_or(30);
+            parsed.clamp(10, 300)
+        };
+        assert_eq!(clamp("30"), 30);
+        assert_eq!(clamp("1"), 10);
+        assert_eq!(clamp("1000"), 300);
+        assert_eq!(clamp("garbage"), 30);
     }
 }

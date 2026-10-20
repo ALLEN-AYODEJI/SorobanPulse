@@ -355,13 +355,53 @@ def get_events(base_url: str, **params):
 
 ## Error handling
 
-All error responses use a consistent JSON envelope:
+All error responses use the [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)
+`application/problem+json` media type:
+
+```
+HTTP/1.1 400 Bad Request
+Content-Type: application/problem+json
+```
 
 ```json
 {
-  "error": "human-readable description"
+  "type": "https://sorobanpulse.dev/errors/invalid-parameter",
+  "title": "Invalid parameter",
+  "status": 400,
+  "detail": "`from_ledger` must not be greater than `to_ledger`",
+  "instance": "/v1/events"
 }
 ```
+
+### Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string (URI) | Stable identifier for the error kind.  Dereferencing it documents the error. |
+| `title` | string | Short, human-readable summary of the error kind (stable per `type`). |
+| `status` | integer | HTTP status code, duplicated in the body for convenience. |
+| `detail` | string | Human-readable explanation specific to this occurrence. |
+| `instance` | string | URI of the request that produced the error (usually the path). |
+
+### `type` URI convention
+
+`type` values are absolute URIs under `https://sorobanpulse.dev/errors/`.
+Clients should branch on `type`, not on `title` or `detail` (which may change
+wording).  Examples:
+
+| `type` | Typical status |
+|---|---|
+| `https://sorobanpulse.dev/errors/invalid-parameter` | `400` |
+| `https://sorobanpulse.dev/errors/unauthorized` | `401` |
+| `https://sorobanpulse.dev/errors/forbidden` | `403` |
+| `https://sorobanpulse.dev/errors/not-found` | `404` |
+| `https://sorobanpulse.dev/errors/validation-failed` | `422` |
+| `https://sorobanpulse.dev/errors/rate-limited` | `429` |
+| `https://sorobanpulse.dev/errors/internal` | `500` |
+| `https://sorobanpulse.dev/errors/unavailable` | `503` |
+
+> Older clients that read the legacy `error` field should migrate to `detail`.
+=======
 
 ### HTTP status codes
 
@@ -385,10 +425,19 @@ HTTP_CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" \
   "http://localhost:3000/v1/events")
 
 if [ "$HTTP_CODE" -ne 200 ]; then
-  echo "Error $HTTP_CODE: $(jq -r .error /tmp/resp.json)"
+  echo "Error $HTTP_CODE: $(jq -r .detail /tmp/resp.json)"
   exit 1
 fi
 cat /tmp/resp.json
+```
+
+### Parsing problems in Python
+
+```python
+resp = requests.get("http://localhost:3000/v1/events")
+if resp.status_code >= 400:
+    problem = resp.json()  # Content-Type: application/problem+json
+    print(problem["type"], problem["title"], problem.get("detail"))
 ```
 
 ### Retryable vs non-retryable errors
@@ -423,6 +472,73 @@ def get_with_retry(url, max_retries=5):
             print(f"Connection error: {e}. Retrying in {wait}s")
             time.sleep(wait)
     raise RuntimeError(f"Failed after {max_retries} retries")
+```
+
+---
+
+## Idempotency keys
+
+POST endpoints that create resources accept an optional `Idempotency-Key`
+header.  Send a unique value (e.g. a UUID v4) with the request; retrying with
+the **same** key returns the original response instead of creating a duplicate.
+
+```bash
+KEY=$(uuidgen)
+
+# First attempt — creates the subscription
+curl -X POST http://localhost:3000/v1/subscriptions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"contract_id":"CABC...","event_type":"contract"}'
+
+# Retry after a timeout — same key, same response, no duplicate created
+curl -X POST http://localhost:3000/v1/subscriptions \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $KEY" \
+  -d '{"contract_id":"CABC...","event_type":"contract"}'
+```
+
+### Semantics
+
+- **Missing header** — the request is processed normally; no idempotency
+  guarantee is provided.
+- **Same key, same request body** — the cached response (status code and body)
+  is replayed.  Only one resource is created.
+- **Same key, different request body** — rejected with `422 Unprocessable
+  Entity` (the key is already bound to a different request).
+- **TTL** — keys are retained for **24 hours**, after which they are purged and
+  the key may be reused.
+
+### Supported endpoints
+
+| Endpoint | Method |
+|---|---|
+| `/v1/subscriptions` | `POST` |
+| `/v1/webhooks` (webhook registration) | `POST` |
+
+### Retry recipe (Python)
+
+```python
+import uuid, requests
+
+def create_subscription(base_url, api_key, payload, max_retries=5):
+    key = str(uuid.uuid4())  # reuse across retries
+    for attempt in range(max_retries):
+        resp = requests.post(
+            f"{base_url}/v1/subscriptions",
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Idempotency-Key": key},
+            timeout=10,
+        )
+        if resp.status_code in (429, 500, 502, 503, 504):
+            time.sleep(min(2 ** attempt, 60))
+            continue
+        resp.raise_for_status()
+        return resp.json()
+    raise RuntimeError("Failed after retries")
 ```
 
 ---

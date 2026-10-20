@@ -7,6 +7,14 @@
       "type": "datasource",
       "pluginId": "prometheus",
       "pluginName": "Prometheus"
+    },
+    {
+      "name": "DS_LOKI",
+      "label": "Loki",
+      "description": "Loki datasource",
+      "type": "datasource",
+      "pluginId": "loki",
+      "pluginName": "Loki"
     }
   ],
   "__requires": [
@@ -50,6 +58,18 @@
       "type": "panel",
       "id": "bargauge",
       "name": "Bar gauge",
+      "version": ""
+    },
+    {
+      "type": "datasource",
+      "id": "loki",
+      "name": "Loki",
+      "version": "1.0.0"
+    },
+    {
+      "type": "panel",
+      "id": "logs",
+      "name": "Logs",
       "version": ""
     }
   ],
@@ -1279,324 +1299,44 @@
         "x": 0,
         "y": 73
       },
-      "id": 207,
-      "panels": [],
-      "title": "Contract Resource Usage (#1257)",
+      "id": 300,
+      "title": "Logs",
       "type": "row"
     },
     {
       "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            }
-          },
-          "mappings": [],
-          "unit": "none"
-        },
-        "overrides": []
+        "type": "loki",
+        "uid": "${DS_LOKI}"
       },
       "gridPos": {
-        "h": 10,
-        "w": 8,
-        "x": 0,
-        "y": 74
-      },
-      "id": 208,
-      "options": {
-        "displayMode": "gradient",
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showUnfilled": true,
-        "text": {
-          "titleSize": 14,
-          "valueSize": 12
-        }
-      },
-      "pluginVersion": "9.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "topk(10, soroban_pulse_contract_resource_fee_total{instance=~\"$instance\"})",
-          "legendFormat": "{{contract_id}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Resource Fee Top-10 (stroops)",
-      "type": "bargauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            }
-          },
-          "mappings": [],
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 10,
-        "w": 8,
-        "x": 8,
-        "y": 74
-      },
-      "id": 209,
-      "options": {
-        "displayMode": "gradient",
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showUnfilled": true,
-        "text": {
-          "titleSize": 14,
-          "valueSize": 12
-        }
-      },
-      "pluginVersion": "9.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "topk(10, soroban_pulse_contract_cpu_insns_avg{instance=~\"$instance\"})",
-          "legendFormat": "{{contract_id}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Avg CPU Instructions per Tx (Top-10)",
-      "type": "bargauge"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            }
-          },
-          "mappings": [],
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 10,
-        "w": 8,
-        "x": 16,
-        "y": 74
-      },
-      "id": 210,
-      "options": {
-        "displayMode": "gradient",
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "orientation": "horizontal",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "showUnfilled": true,
-        "text": {
-          "titleSize": 14,
-          "valueSize": 12
-        }
-      },
-      "pluginVersion": "9.0.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "topk(10, soroban_pulse_contract_mem_bytes_avg{instance=~\"$instance\"})",
-          "legendFormat": "{{contract_id}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Avg Memory per Tx (Top-10)",
-      "type": "bargauge"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
+        "h": 12,
         "w": 24,
         "x": 0,
-        "y": 84
+        "y": 74
       },
-      "id": 211,
-      "panels": [],
-      "title": "RPC Endpoints (#1256)",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "id": 212,
-      "title": "RPC Endpoint Latency (p50)",
-      "type": "timeseries",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 85
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ms",
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
-      },
+      "id": 301,
       "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "lastNotNull",
-            "mean"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
       },
       "targets": [
         {
           "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
+            "type": "loki",
+            "uid": "${DS_LOKI}"
           },
-          "expr": "soroban_pulse_rpc_endpoint_latency_ms{instance=~\"$instance\"}",
-          "legendFormat": "{{endpoint}}",
+          "expr": "{container=\"soroban-pulse\"}",
           "refId": "A"
         }
-      ]
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${DS_PROMETHEUS}"
-      },
-      "id": 213,
-      "title": "RPC Endpoint Availability",
-      "type": "state-timeline",
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 85
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "red",
-                "value": null
-              },
-              {
-                "color": "green",
-                "value": 1
-              }
-            ]
-          },
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "0": {
-                  "text": "unavailable"
-                },
-                "1": {
-                  "text": "available"
-                }
-              }
-            }
-          ]
-        },
-        "overrides": []
-      },
-      "options": {
-        "showValue": "never",
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${DS_PROMETHEUS}"
-          },
-          "expr": "soroban_pulse_rpc_endpoint_available{instance=~\"$instance\"}",
-          "legendFormat": "{{endpoint}}",
-          "refId": "A"
-        }
-      ]
+      ],
+      "title": "Soroban Pulse Logs",
+      "type": "logs"
     }
   ],
   "refresh": "30s",
@@ -1617,6 +1357,18 @@
         "name": "DS_PROMETHEUS",
         "options": [],
         "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Loki Datasource",
+        "multi": false,
+        "name": "DS_LOKI",
+        "options": [],
+        "query": "loki",
         "refresh": 1,
         "type": "datasource"
       },

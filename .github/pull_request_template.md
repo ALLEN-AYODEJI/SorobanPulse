@@ -4,7 +4,16 @@
 
 ## Related Issue
 
+<!--
+  One issue per PR. Only list several issues if they are tightly related,
+  and explain why below. You must be assigned to every issue you close.
+  See CONTRIBUTING.md → "Pull Requests".
+-->
+
 Closes #<!-- issue number -->
+
+- [ ] I am assigned to the linked issue(s)
+- [ ] This PR addresses a single issue (or tightly related issues, explained in Notes)
 
 ## Changes
 
@@ -16,8 +25,9 @@ Closes #<!-- issue number -->
 
 <!-- Describe how you tested this. -->
 
-- [ ] `cargo test` passes
-- [ ] `cargo clippy` reports no warnings
+- [ ] `make test` passes
+- [ ] `make lint` (fmt + clippy) reports no warnings
+- [ ] Required CI checks are green (see CONTRIBUTING.md → "Pull Requests")
 - [ ] Manually tested locally
 
 ## Security Considerations

@@ -189,6 +189,9 @@ Set `RATE_LIMIT_PER_MINUTE=0` to disable rate limiting entirely.
 - [Contract Event Schemas](https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/contract-event-schemas.md)"
     ),
     paths(
+        crate::job_scheduler::list_jobs,
+        crate::account_events::get_account_events,
+        crate::sep41::get_sep41_events,
         handlers::health,
         crate::meta::get_meta,
         crate::contract_resource_stats::get_contract_resource_stats,
@@ -561,6 +564,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/reencrypt", axum::routing::post(handlers::start_reencrypt))
         .route("/admin/token-transfers/backfill", axum::routing::post(crate::token_events::backfill_token_transfers))
         .route("/admin/event-addresses/backfill", axum::routing::post(crate::account_events::backfill_event_addresses))
+        .route("/admin/sep41/backfill", axum::routing::post(crate::sep41::backfill_sep41))
         .route("/admin/contracts/{contract_id}/abi", axum::routing::post(handlers::register_contract_abi).get(handlers::get_contract_abi))
         .route("/admin/contracts/{contract_id}/metadata", axum::routing::post(handlers::upsert_contract_metadata).delete(handlers::delete_contract_metadata))
         .route("/admin/contracts/metadata/import", axum::routing::post(handlers::bulk_import_contract_metadata))
@@ -585,6 +589,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/statistics/jobs", axum::routing::get(handlers::get_analysis_jobs))
         // #696: SLI / SLO dashboard reporting endpoints (admin-gated)
         .route("/admin/slo/report", axum::routing::get(handlers::get_slo_report))
+        .route("/admin/jobs", axum::routing::get(crate::job_scheduler::list_jobs))
         .route("/admin/slo/sample", axum::routing::post(handlers::record_slo_sample))
         // #894: Backup verification
         .route("/admin/backup/verification/report", axum::routing::get(handlers::get_backup_verification_report))
@@ -743,6 +748,7 @@ pub fn create_router_with_tx_and_tenant_map(
         .route("/admin/compression/migrate", axum::routing::post(handlers::start_compression_migration))
         .route("/tokens/{contract_id}/transfers", axum::routing::get(crate::token_events::get_token_transfers))
         .route("/accounts/{address}/events", axum::routing::get(crate::account_events::get_account_events))
+        .route("/events/sep41", axum::routing::get(crate::sep41::get_sep41_events))
         .route("/contracts/{contract_id}/versions", axum::routing::get(crate::contract_versions::get_contract_versions))
         // Issue #607: Cached ABI endpoint
         .route("/contracts/{contract_id}/abi/cached", axum::routing::get(handlers::get_contract_abi_cached))
