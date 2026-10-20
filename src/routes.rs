@@ -145,6 +145,8 @@ pub struct AppState {
     /// Deployment role for this instance — used by the readiness handler to
     /// apply role-specific readiness semantics.
     pub role: crate::config::Role,
+    /// Issue #959: Serialization cache for hot events (5-second TTL, versioned invalidation).
+    pub serialization_cache: std::sync::Arc<crate::serialization_cache::SerializedEventCache>,
 }
 
 /// OpenAPI spec — all paths are documented via #[utoipa::path] on handlers.
@@ -506,6 +508,14 @@ pub fn create_router_with_tx_and_tenant_map(
         24, // 24 hour retention
     );
 
+    // Initialize serialization cache with 5-second TTL (Issue #959)
+    let serialization_cache = std::sync::Arc::new(
+        crate::serialization_cache::SerializedEventCache::new(
+            crate::serialization_cache::DEFAULT_MAX_CAPACITY,
+            5, // 5 second TTL for hot events
+        )
+    );
+
     let app_state = AppState {
         db: pool.clone(),
         pool,
@@ -537,16 +547,22 @@ pub fn create_router_with_tx_and_tenant_map(
         circuit_breaker_manager,
         bulk_export_manager,
         role: config.role.clone(),
+        serialization_cache: serialization_cache.clone(),
     };
 
     // Spawn cache invalidation task: subscribe to the broadcast channel and
     // evict the contract_count_cache entry whenever a new event is indexed.
+    // Also invalidate serialization cache entries for the affected contract.
     {
         let mut rx = app_state.event_tx.subscribe();
-        let cache = app_state.contract_count_cache.clone();
+        let count_cache = app_state.contract_count_cache.clone();
+        let ser_cache = serialization_cache.clone();
         tokio::spawn(async move {
             while let Ok(event) = rx.recv().await {
-                cache.invalidate(&event.contract_id).await;
+                count_cache.invalidate(&event.contract_id).await;
+                // Invalidate serialization cache for this contract's events
+                // Using entity type version bump for all cached results of this contract
+                ser_cache.invalidate_entity_type(&format!("event:{}", event.contract_id)).await;
                 crate::metrics::record_contract_count_cache_invalidation();
             }
         });
@@ -1573,6 +1589,14 @@ pub fn create_minimal_router(
         crate::adaptive_pool::AdaptivePoolConfig::default(),
     ));
 
+    // Initialize serialization cache with 5-second TTL (Issue #959)
+    let serialization_cache = std::sync::Arc::new(
+        crate::serialization_cache::SerializedEventCache::new(
+            crate::serialization_cache::DEFAULT_MAX_CAPACITY,
+            5, // 5 second TTL for hot events
+        )
+    );
+
     let app_state = AppState {
         pool: pool.clone(),
         read_pool,
@@ -1604,6 +1628,7 @@ pub fn create_minimal_router(
         circuit_breaker_manager: crate::webhook_circuit_breaker::CircuitBreakerManager::new(),
         bulk_export_manager: crate::bulk_export::BulkExportManager::new(),
         role: config.role.clone(),
+        serialization_cache,
     };
 
     Router::new()
