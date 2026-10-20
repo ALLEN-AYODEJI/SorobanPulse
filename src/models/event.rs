@@ -297,7 +297,8 @@ pub struct SearchParams {
 impl SearchParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
-        (page - 1) * self.limit()
+        // Saturate so huge `page` values cannot overflow (Issue #1225).
+        (page - 1).saturating_mul(self.limit())
     }
 
     pub fn limit(&self) -> i64 {
@@ -773,7 +774,8 @@ impl PaginationParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
         let limit = self.limit();
-        (page - 1) * limit
+        // Saturate so huge `page` values cannot overflow (Issue #1225).
+        (page - 1).saturating_mul(limit)
     }
 
     pub fn limit(&self) -> i64 {
@@ -985,6 +987,17 @@ mod tests {
     #[test]
     fn page_3_limit_10_offset_is_20() {
         assert_eq!(params(Some(3), Some(10)).offset(), 20);
+    }
+
+    // Regression test for fuzz crash in fuzz_pagination_params (Issue #1225).
+    #[test]
+    fn huge_page_offset_saturates_instead_of_overflowing() {
+        let p: PaginationParams =
+            serde_json::from_str(r#"{"page":9223372036854775807,"limit":100}"#).unwrap();
+        assert_eq!(p.offset(), i64::MAX);
+        let s: SearchParams =
+            serde_json::from_str(r#"{"page":9223372036854775807,"limit":100}"#).unwrap();
+        assert_eq!(s.offset(), i64::MAX);
     }
 
     // --- RPC deserialization fixture tests ---

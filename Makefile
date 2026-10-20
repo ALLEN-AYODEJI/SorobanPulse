@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build test test-db lint fmt run docker-up docker-down migrate clean gen-openapi gen-postman deny
+.PHONY: help build test test-db lint fmt run docker-up docker-down migrate clean gen-openapi gen-postman gen-config-docs docs deny
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*##"}; {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -80,6 +80,13 @@ gen-openapi: ## Regenerate openapi.json from handler signatures and sync docs/op
 	cargo run --bin gen_openapi > openapi.json
 	cp openapi.json docs/openapi.json
 
+gen-config-docs: ## Regenerate docs/configuration.md and .env.example from src/config/reference.rs
+	cargo run --bin gen_config_docs
+
+docs: ## Build the documentation site (docs/site) and check every doc is in the navigation
+	cp openapi.json docs/site/static/openapi.json
+	cd docs/site && npm ci && npm run check-nav && npm run build
+
 gen-postman: gen-openapi ## Regenerate Postman collection and environment files from OpenAPI spec
 	cargo run --bin gen_postman -- --input openapi.json --output-dir postman/
 changelog: ## Generate changelog from git history (requires git-cliff)
@@ -130,7 +137,10 @@ web-build: ## Build the web dashboard for production
 web-lint: ## Lint and type-check the web dashboard
 	cd web && npm ci && npm run lint && npm run typecheck
 
-.PHONY: web-dev web-build web-lint
+web-test: ## Run web dashboard tests
+	cd web && npm ci && npm run test
+
+.PHONY: web-dev web-build web-lint web-test
 
 fuzz: ## Run fuzz tests locally (60 seconds each)
 	@command -v cargo-fuzz >/dev/null 2>&1 || cargo install cargo-fuzz

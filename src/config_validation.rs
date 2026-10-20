@@ -489,6 +489,13 @@ pub fn config_schema() -> Vec<ConfigFieldDoc> {
             category: "rpc",
         },
         ConfigFieldDoc {
+            env_var: "STELLAR_RPC_URLS",
+            description: "Comma-separated RPC endpoints for the same network; requests go to the lowest-latency healthy one. Overrides STELLAR_RPC_URL",
+            default: None,
+            required: false,
+            category: "rpc",
+        },
+        ConfigFieldDoc {
             env_var: "STELLAR_RPC_FALLBACK_URLS",
             description: "Comma-separated fallback RPC URLs tried when the primary fails",
             default: None,
