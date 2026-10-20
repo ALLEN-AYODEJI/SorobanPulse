@@ -130,6 +130,10 @@ version = "0.19"
 optional = true
 
 [[bin]]
+name = "gen_env_docs"
+path = "src/bin/gen_env_docs.rs"
+
+[[bin]]
 name = "gen_postman"
 path = "src/bin/gen_postman.rs"
 
