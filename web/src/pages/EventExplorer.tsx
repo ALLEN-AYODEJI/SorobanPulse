@@ -118,7 +118,7 @@ function EventExplorer() {
     <div style={{ padding: '2rem' }}>
       <h1>Event Explorer</h1>
 
-      <div style={{ margin: '1rem 0', display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
+      <div className="filters" style={{ margin: '1rem 0' }}>
         <input
           type="text"
           placeholder="Contract ID"
@@ -146,11 +146,11 @@ function EventExplorer() {
       </div>
 
       {loading && <p>Loading...</p>}
-      {error && <p style={{ color: 'red' }}>Error: {error}</p>}
+      {error && <p style={{ color: '#ef4444' }}>Error: {error}</p>}
       {!loading && !error && events.length === 0 && <p>No events found</p>}
 
       {sortedEvents.length > 0 && (
-        <div onKeyDown={handleKeyDown} tabIndex={0}>
+        <div onKeyDown={handleKeyDown} tabIndex={0} className="table-wrapper">
           <table>
             <thead>
               <tr>
@@ -177,7 +177,7 @@ function EventExplorer() {
                 <tr
                   key={event.id}
                   style={{
-                    backgroundColor: idx === selectedRow ? '#e3f2fd' : 'transparent',
+                    backgroundColor: idx === selectedRow ? 'var(--table-header-hover)' : 'transparent',
                   }}
                 >
                   <td>{event.id.substring(0, 8)}...</td>

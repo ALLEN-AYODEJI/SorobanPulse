@@ -111,6 +111,26 @@ pub fn record_events_indexed(count: u64) {
     m::counter!("soroban_pulse_events_indexed_total").increment(count);
 }
 
+/// Issue #1252: highest ledger a Galexie backfill run has fully processed.
+pub fn update_backfill_progress_ledger(ledger: u64) {
+    m::gauge!("soroban_pulse_backfill_progress_ledger").set(ledger as f64);
+}
+
+/// Issue #1252: ledgers processed by backfill.
+pub fn record_backfill_ledgers(count: u64) {
+    m::counter!("soroban_pulse_backfill_ledgers_total").increment(count);
+}
+
+/// Issue #1252: events newly inserted by backfill (duplicates excluded).
+pub fn record_backfill_events(count: u64) {
+    m::counter!("soroban_pulse_backfill_events_total").increment(count);
+}
+
+/// Issue #1255: a contract entered the deployment registry.
+pub fn record_contract_tracked() {
+    m::counter!("soroban_pulse_contracts_tracked_total").increment(1);
+}
+
 /// Update the current ledger being processed
 pub fn update_current_ledger(ledger: u64) {
     m::gauge!("soroban_pulse_indexer_current_ledger").set(ledger as f64);
@@ -358,6 +378,19 @@ pub fn record_rpc_failover() {
 /// Update the active RPC endpoint label gauge (1.0 = active)
 pub fn set_rpc_active_endpoint(endpoint: &str) {
     m::gauge!("soroban_pulse_rpc_active_endpoint", "url" => endpoint.to_string()).set(1.0);
+}
+
+/// Issue #1256: p50 probe latency of an RPC endpoint, in milliseconds.
+pub fn set_rpc_endpoint_latency_ms(endpoint: &str, latency_ms: f64) {
+    m::gauge!("soroban_pulse_rpc_endpoint_latency_ms", "endpoint" => endpoint.to_string())
+        .set(latency_ms);
+}
+
+/// Issue #1256: whether an RPC endpoint is in rotation (1) or marked
+/// unavailable after repeated errors (0).
+pub fn set_rpc_endpoint_available(endpoint: &str, available: bool) {
+    m::gauge!("soroban_pulse_rpc_endpoint_available", "endpoint" => endpoint.to_string())
+        .set(if available { 1.0 } else { 0.0 });
 }
 
 /// Record a Kinesis ProvisionedThroughputExceededException (throttled record)
@@ -779,6 +812,27 @@ pub fn update_contract_event_count(contract_id: &str, count: i64) {
         "contract_id" => contract_id.to_string()
     )
     .set(count as f64);
+}
+
+/// Issue #1257: per-contract resource usage for the Grafana "Contract
+/// Resource Usage" panels. Only the top contracts by total fee are exported.
+pub fn update_contract_resource_stats(
+    contract_id: &str,
+    total_resource_fee: Option<i64>,
+    avg_cpu_insns: Option<f64>,
+    avg_mem_bytes: Option<f64>,
+) {
+    let label = contract_id.to_string();
+    if let Some(v) = total_resource_fee {
+        m::gauge!("soroban_pulse_contract_resource_fee_total", "contract_id" => label.clone())
+            .set(v as f64);
+    }
+    if let Some(v) = avg_cpu_insns {
+        m::gauge!("soroban_pulse_contract_cpu_insns_avg", "contract_id" => label.clone()).set(v);
+    }
+    if let Some(v) = avg_mem_bytes {
+        m::gauge!("soroban_pulse_contract_mem_bytes_avg", "contract_id" => label).set(v);
+    }
 }
 
 /// #695: Record an observation of indexer lag for heatmap distribution.

@@ -228,6 +228,43 @@ async fn main() -> anyhow::Result<()> {
         info!("RUN_MIGRATIONS_ON_STARTUP=false — skipping startup migrations (expected to be run by the Helm migration Job)");
     }
 
+    // Issue #1252: `--backfill-from <ledger> --backfill-to <ledger>` replays
+    // historical ledgers from the Galexie data lake through the indexer's
+    // insert path, then exits. Safe to run alongside a live indexer.
+    match soroban_pulse::backfill::parse_cli_range(std::env::args().skip(1)) {
+        Ok(None) => {}
+        Ok(Some((from, to))) => {
+            let cfg = match soroban_pulse::backfill::BackfillConfig::from_env(from, to, &config.chain_id) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    error!(error = %e, "invalid backfill configuration");
+                    std::process::exit(2);
+                }
+            };
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let sink = std::sync::Arc::new(soroban_pulse::indexer::Indexer::new(
+                pool.clone(),
+                config.clone(),
+                shutdown_rx,
+                soroban_pulse::indexer::SorobanRpcClient::new(&config),
+            ));
+            match soroban_pulse::backfill::run(pool.clone(), sink, cfg).await {
+                Ok(summary) => {
+                    info!(ledgers = summary.ledgers, events_inserted = summary.events_inserted, "Backfill complete — exiting");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    error!(error = %e, "Backfill failed — re-run the same command to resume");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "invalid backfill arguments");
+            std::process::exit(2);
+        }
+    }
+
     // Create read pool: use replica URL if configured, otherwise reuse primary pool.
     let read_pool = if let Some(ref replica_url) = config.database_replica_url {
         info!("DATABASE_REPLICA_URL set — HTTP handlers will use read replica");
@@ -582,6 +619,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Build and wire up the indexer only when this instance is configured to run it.
     let rpc_client = indexer::SorobanRpcClient::new(&config);
+    // Issue #1256: measures endpoint latency for routing; spawned with the indexer.
+    let rpc_latency_probe = rpc_client.latency_probe();
     let mut indexer = indexer::Indexer::new(
         pool.clone(),
         config.clone(),
@@ -731,8 +770,12 @@ async fn main() -> anyhow::Result<()> {
             let mut network_config = config.clone();
             network_config.chain_id = target.chain_id.clone();
             network_config.stellar_rpc_url = target.rpc_url.clone();
+            // The primary network's fallbacks belong to a different chain;
+            // never route this network's requests to them.
+            network_config.stellar_rpc_fallback_urls = Vec::new();
 
             let network_rpc_client = indexer::SorobanRpcClient::new(&network_config);
+            tokio::spawn(network_rpc_client.latency_probe().run(shutdown_rx.clone()));
             let mut network_indexer = indexer::Indexer::new(
                 pool.clone(),
                 network_config,
