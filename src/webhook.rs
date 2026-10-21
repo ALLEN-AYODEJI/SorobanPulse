@@ -4,7 +4,7 @@ use sha2::Sha256;
 use sqlx::Row;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Span};
 use uuid::Uuid;
 
 /// Validate that `url` is reachable and returns a 2xx response.
@@ -127,6 +127,25 @@ pub async fn deliver_with_retry_policy(
     retry_policy: &crate::retry_policy::RetryPolicy,
     priority: String,
 ) {
+    // Create a root span for the entire delivery lifecycle
+    #[cfg(feature = "full-observability")]
+    let root_span = tracing::info_span!(
+        "webhook_delivery",
+        webhook_url = %url,
+        contract_id = %event.contract_id,
+        tx_hash = %event.tx_hash,
+        priority = %priority,
+    );
+
+    #[cfg(not(feature = "full-observability"))]
+    let root_span = tracing::info_span!(
+        "webhook_delivery",
+        webhook_url = %url,
+        contract_id = %event.contract_id,
+    );
+
+    let _enter = root_span.enter();
+
     // Check suppression list before attempting delivery (Issue #490)
     if let Some(pool) = pool {
         match sqlx::query_scalar::<_, i64>(
@@ -219,6 +238,22 @@ pub async fn deliver_with_retry_policy(
             let log_event_type = log_event_type.clone();
 
             async move {
+                // Create a child span for this attempt
+                #[cfg(feature = "full-observability")]
+                let attempt_span = tracing::info_span!(
+                    "webhook_attempt",
+                    attempt = attempt,
+                    parent: &tracing::Span::current(),
+                );
+
+                #[cfg(not(feature = "full-observability"))]
+                let attempt_span = tracing::info_span!(
+                    "webhook_attempt",
+                    attempt = attempt,
+                );
+
+                let _enter = attempt_span.enter();
+
                 let mut req = client
                     .post(&url)
                     .header("Content-Type", "application/json")
@@ -229,9 +264,19 @@ pub async fn deliver_with_retry_policy(
                     req = req.header("X-Signature-256", format!("sha256={sig}"));
                 }
 
+                // Create a span for the HTTP send
+                #[cfg(feature = "full-observability")]
+                let send_span = tracing::info_span!("webhook_http_send");
+
+                #[cfg(not(feature = "full-observability"))]
+                let send_span = tracing::info_span!("webhook_http_send");
+
+                let _send_enter = send_span.enter();
+
                 let started_at = std::time::Instant::now();
                 let send_result = req.send().await;
                 let duration_ms = started_at.elapsed().as_millis() as i64;
+                drop(_send_enter);
 
                 // Record the notification delivery cost for this attempt,
                 // attributed to the webhook component (Issue #1264).
@@ -247,6 +292,7 @@ pub async fn deliver_with_retry_policy(
                             contract_id = %event.contract_id,
                             attempt = attempt,
                             priority = %event.event_type,
+                            duration_ms = duration_ms,
                             "Webhook delivered successfully"
                         );
                         crate::metrics::record_webhook_delivery_success();
@@ -338,6 +384,9 @@ pub async fn deliver_with_retry_policy(
                 max_attempts = retry_policy.max_attempts,
                 "Webhook delivery failed after all retries"
             );
+
+            #[cfg(feature = "full-observability")]
+            metrics::record_webhook_trace_error();
 
             if let Some(pool) = pool {
                 let next_retry = record_endpoint_failure(pool, &url).await;

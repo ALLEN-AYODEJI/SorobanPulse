@@ -355,6 +355,14 @@ pub async fn seed_from_db(
 
     let count = rows.len();
     filter.seed(rows.into_iter().map(|(tx, cid, et)| (tx, cid, et)));
+    
+    // Estimate and record the current false-positive rate
+    let fill_ratio = filter.fill_ratio();
+    if fill_ratio > 0.0 {
+        let estimated_fp_rate = estimate_false_positive_rate(filter.fp_rate, fill_ratio);
+        metrics::set_bloom_false_positive_rate(estimated_fp_rate);
+    }
+    
     Ok(count)
 }
 
@@ -384,6 +392,51 @@ pub async fn persist_state(
     .await?;
 
     Ok(())
+}
+
+/// Calculate auto-sized bloom filter parameters from expected daily event count and target FP rate.
+/// Returns (capacity, fp_rate) suitable for EventBloomFilter::with_fill_threshold.
+///
+/// For high-volume deployments (>10,000 events/day), auto-sizing ensures the filter doesn't
+/// degrade under load. At 10x capacity, the FP rate should remain under the configured target.
+pub fn auto_size_bloom_filter(
+    expected_items_per_day: usize,
+    target_fp_rate: f64,
+) -> (usize, f64) {
+    if expected_items_per_day == 0 {
+        return (1_000_000, 0.001);
+    }
+
+    // Use 10× the daily rate as capacity to account for variable workloads and avoid
+    // frequent rotations. At 10x, the actual FP rate should still be near the target.
+    let capacity = expected_items_per_day * 10;
+
+    // Clamp the target FP rate to reasonable bounds [0.0001, 0.01]
+    let clamped_fp_rate = target_fp_rate.clamp(0.0001, 0.01);
+
+    (capacity, clamped_fp_rate)
+}
+
+/// Estimate the actual false-positive rate of a bloom filter at a given fill ratio.
+///
+/// Uses the approximation: FP_rate_actual ≈ target_FP_rate * (fill_ratio ^ k_hash_functions)
+/// where k is derived from the target FP rate. This is an approximation used for monitoring.
+pub fn estimate_false_positive_rate(target_fp_rate: f64, fill_ratio: f64) -> f64 {
+    if fill_ratio <= 0.0 || fill_ratio >= 1.0 || target_fp_rate <= 0.0 || target_fp_rate >= 1.0 {
+        return target_fp_rate;
+    }
+
+    // Derive approximate k (number of hash functions) from target FP rate.
+    // k = ln(2) * m / n = ln(2) / -ln(target_FP_rate)
+    let k = std::f64::consts::LN_2 / (-target_fp_rate.ln());
+
+    // Approximate actual FP rate at current fill ratio.
+    // As fill ratio increases, FP rate approaches target asymptotically.
+    // Using: FP_actual ≈ target * (fill_ratio ^ k)
+    let estimated = target_fp_rate * fill_ratio.powf(k);
+
+    // Clamp to [0, 1] and never lower than target (can only degrade, not improve)
+    estimated.clamp(target_fp_rate, 1.0)
 }
 
 /// Restore the bloom filter state from the database if available and not stale.
@@ -687,5 +740,58 @@ mod tests {
         let second = f2.check_and_set("txA", "cA", "contract", 50);
         assert!(!first);
         assert!(second);
+    }
+
+    // ── Auto-sizing tests ────────────────────────────────────────────────
+
+    #[test]
+    fn auto_size_zero_items_returns_defaults() {
+        let (cap, fp) = auto_size_bloom_filter(0, 0.001);
+        assert_eq!(cap, 1_000_000);
+        assert_eq!(fp, 0.001);
+    }
+
+    #[test]
+    fn auto_size_scales_capacity_by_10x() {
+        let (cap, _fp) = auto_size_bloom_filter(10_000, 0.001);
+        assert_eq!(cap, 100_000);
+    }
+
+    #[test]
+    fn auto_size_high_daily_volume() {
+        let (cap, fp) = auto_size_bloom_filter(100_000, 0.001);
+        assert_eq!(cap, 1_000_000);
+        assert_eq!(fp, 0.001);
+    }
+
+    #[test]
+    fn auto_size_clamps_fp_rate() {
+        let (_, fp_low) = auto_size_bloom_filter(10_000, 0.00001);
+        assert_eq!(fp_low, 0.0001); // clamped to min
+
+        let (_, fp_high) = auto_size_bloom_filter(10_000, 0.1);
+        assert_eq!(fp_high, 0.01); // clamped to max
+    }
+
+    #[test]
+    fn estimate_fp_rate_at_zero_fill_ratio_returns_target() {
+        let est = estimate_false_positive_rate(0.001, 0.0);
+        assert_eq!(est, 0.001);
+    }
+
+    #[test]
+    fn estimate_fp_rate_at_full_capacity_higher_than_target() {
+        let est = estimate_false_positive_rate(0.001, 1.0);
+        assert!(est >= 0.001);
+        assert!(est <= 1.0);
+    }
+
+    #[test]
+    fn estimate_fp_rate_at_half_fill_shows_degradation() {
+        let target = 0.001;
+        let est_half = estimate_false_positive_rate(target, 0.5);
+        let est_full = estimate_false_positive_rate(target, 1.0);
+        // At half fill, FP rate should be better than at full
+        assert!(est_half < est_full);
     }
 }

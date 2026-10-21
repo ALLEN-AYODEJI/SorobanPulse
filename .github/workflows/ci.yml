@@ -199,6 +199,49 @@ jobs:
       # Build with the committed .sqlx cache so query macros are verified without a live DB.
       - run: SQLX_OFFLINE=true cargo clippy -- -D warnings
 
+  build-tests:
+    name: Build Tests (cargo-nextest)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name != 'pull_request' ||
+      contains(fromJSON('["src/**", "tests/**", "Cargo.*", "migrations/**", ".sqlx/**"]'), github.event.pull_request.changed_files)
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: soroban_pulse_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: stable-nextest
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .sqlx
+          key: ${{ runner.os }}-sqlx-${{ hashFiles('.sqlx/**') }}
+          restore-keys: ${{ runner.os }}-sqlx-
+      - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev
+      - uses: taiki-e/install-action@nextest
+      - name: Run sqlx prepare check
+        run: cargo sqlx prepare --check
+      - name: Build test archive
+        run: cargo nextest archive --archive-file nextest-archive.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+
   sqlx-prepare-check:
     name: sqlx prepare --check
     runs-on: ubuntu-latest
@@ -803,6 +846,7 @@ jobs:
       - web
       - extension
       - clippy
+      - build-tests
       - sqlx-prepare-check
       - features
       - test

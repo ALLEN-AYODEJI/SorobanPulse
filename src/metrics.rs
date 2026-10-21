@@ -720,6 +720,18 @@ pub fn record_bloom_filter_rotation() {
     m::counter!("soroban_pulse_bloom_filter_rotations_total").increment(1);
 }
 
+/// Issue #XXX: Update the estimated false-positive rate of the bloom filter.
+/// Estimated from current fill ratio and filter parameters.
+pub fn set_bloom_false_positive_rate(rate: f64) {
+    m::gauge!("soroban_pulse_bloom_false_positive_rate").set(rate);
+}
+
+/// Issue #XXX: Record a webhook delivery trace error for end-to-end observability.
+#[cfg(feature = "full-observability")]
+pub fn record_webhook_trace_error() {
+    m::counter!("soroban_pulse_webhook_trace_errors_total").increment(1);
+}
+
 /// Record SSE per-IP connection count (histogram, issue #453)
 pub fn record_sse_connections_per_ip(count: usize) {
     m::histogram!("soroban_pulse_sse_connections_per_ip").record(count as f64);

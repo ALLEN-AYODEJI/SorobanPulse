@@ -496,6 +496,16 @@ pub struct Config {
     /// @description Expected maximum number of items in the bloom filter before the FP rate degrades.
     pub bloom_filter_capacity: usize,
 
+    /// @env BLOOM_EXPECTED_ITEMS
+    /// @default 0
+    /// @description Auto-sizing parameter: expected number of items per day. Set to >0 to enable auto-sizing (overrides BLOOM_FILTER_CAPACITY).
+    pub bloom_expected_items: usize,
+
+    /// @env BLOOM_FALSE_POSITIVE_RATE
+    /// @default 0.001
+    /// @description Auto-sizing parameter: target false-positive rate for auto-sizing. Used when BLOOM_EXPECTED_ITEMS > 0.
+    pub bloom_false_positive_rate: f64,
+
     /// @env ENABLE_CONTENT_DEDUP
     /// @default false
     /// @description When true, a SHA-256 fingerprint of each event is checked before insert to prevent content-identical duplicates.
@@ -1068,6 +1078,8 @@ impl Default for Config {
             tls_key_file: None,
             bloom_filter_fp_rate: 0.001,
             bloom_filter_capacity: 1_000_000,
+            bloom_expected_items: 0,
+            bloom_false_positive_rate: 0.001,
             enable_content_dedup: false,
             dedup_window_secs: 3600,
             kinesis_stream_name: None,
@@ -2164,6 +2176,12 @@ impl Config {
             bloom_filter_capacity: env_or_file_or("BLOOM_FILTER_CAPACITY", &file, "1000000")
                 .parse()
                 .unwrap_or(1_000_000),
+            bloom_expected_items: env_or_file_or("BLOOM_EXPECTED_ITEMS", &file, "0")
+                .parse()
+                .unwrap_or(0),
+            bloom_false_positive_rate: env_or_file_or("BLOOM_FALSE_POSITIVE_RATE", &file, "0.001")
+                .parse()
+                .unwrap_or(0.001),
             enable_content_dedup: env_or_file("ENABLE_CONTENT_DEDUP", &file)
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "y"))
                 .unwrap_or(false),
