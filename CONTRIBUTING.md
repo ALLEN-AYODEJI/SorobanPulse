@@ -15,7 +15,206 @@ and how to become a reviewer or maintainer are described in
 
 Contributions are accepted under the project's [MIT License](LICENSE).
 
-## Running Integration Tests
+## Contributing Your First PR
+
+Welcome! This section walks you through the complete journey from finding an
+issue to getting your first PR merged. No prior contribution experience needed.
+
+### Step 1 — Find an issue to work on
+
+Start with issues labelled
+[`good first issue`](https://github.com/Soroban-Pulse/SorobanPulse/issues?q=is%3Aissue+is%3Aopen+no%3Aassignee+label%3A%22good+first+issue%22).
+These are intentionally small, well-scoped, and have clear acceptance criteria.
+Every `good first issue` comes with enough context to complete it without deep
+project knowledge.
+
+### Step 2 — Claim the issue
+
+Post a comment on the issue:
+
+> "I'd like to work on this. Planning to start today."
+
+Wait until a maintainer assigns the issue to you before you start coding.
+This avoids duplicate work. If no one responds within 48 hours during
+weekdays, feel free to ping in the comment thread.
+
+### Step 3 — Create your branch
+
+Always branch off the latest `main`:
+
+```bash
+git switch main
+git pull --ff-only origin main
+git switch -c fix/1234-describe-the-fix     # for bug fixes
+# or
+git switch -c feat/1324-feature-description # for new features
+# or
+git switch -c docs/1326-contributor-guide   # for documentation
+```
+
+**Branch naming convention:**
+
+```
+<type>/<issue-number>-<short-description>
+```
+
+| Type | When to use |
+|---|---|
+| `fix/` | Bug fixes |
+| `feat/` | New features |
+| `docs/` | Documentation-only changes |
+| `chore/` | Build, CI, or dependency changes |
+| `refactor/` | Code reorganization without behavior changes |
+| `test/` | Adding or improving tests |
+| `perf/` | Performance improvements |
+
+Examples:
+- `fix/1234-indexer-panic-on-empty-events`
+- `feat/1324-cargo-feature-docs`
+- `docs/1326-contributor-workflow`
+
+### Step 4 — Write your change
+
+- Keep the change focused on the issue. Don't fix unrelated issues in the same PR.
+- Follow the code style (`make fmt` enforces rustfmt; `make lint` enforces clippy).
+- Add tests: a failing test before your fix, a passing test after.
+- Update documentation if your change affects user-facing behavior.
+
+### Step 5 — Use Conventional Commits
+
+Commit messages must follow [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<type>(<scope>): <short description in present tense>
+
+<optional body explaining the why, not the what>
+
+Closes #<issue-number>
+```
+
+Examples:
+
+```
+docs(contributing): add first PR walkthrough and branch naming guide
+
+Closes #1326
+```
+
+```
+fix(indexer): handle empty event pages without panicking
+
+Closes #1234
+```
+
+```
+feat(api): add ?event_type filter to GET /v1/events
+
+Closes #1300
+```
+
+Rules:
+- Use present tense: "add feature" not "added feature"
+- Keep the subject under 72 characters
+- Reference the issue with `Closes #N` so it closes automatically on merge
+
+### Step 6 — Run checks locally before pushing
+
+```bash
+make fmt       # auto-format code
+make lint      # clippy with -D warnings
+make test      # full test suite (needs DATABASE_URL or make test-db)
+```
+
+If you do not have a local Postgres instance:
+
+```bash
+make test-db   # starts a Docker Postgres, runs tests, tears it down
+```
+
+### Step 7 — Open the PR
+
+```bash
+git push --set-upstream origin fix/1234-describe-the-fix
+```
+
+Then open a pull request on GitHub:
+
+- **Title:** use a Conventional Commit style title: `fix(indexer): handle empty event pages`
+- **Description:** fill in all sections of the PR template (Summary, Related Issue, Changes, Testing)
+- **Link the issue:** add `Closes #1234` to the description so the issue closes when your PR merges
+- **Assign yourself** (GitHub auto-assigns if you opened the branch from the issue)
+
+### Step 8 — Respond to review feedback
+
+Reviewers may ask questions or request changes. Respond within 7 days.
+
+- Address each comment individually — either make the change or explain why you disagree.
+- Push new commits rather than force-pushing; this keeps the review history intact.
+- Once all conversations are resolved, the reviewer will approve and a maintainer will merge.
+
+### What happens after merge
+
+- The linked issue closes automatically.
+- You will appear in the contributor list and the release notes.
+- You are now eligible to claim issues with `help wanted` and slightly larger scope.
+
+---
+
+## Label Definitions
+
+Labels define what type of work an issue involves, how hard it is, which part
+of the codebase it touches, and whether it is open for contribution.
+They are defined in [`.github/labels.yml`](.github/labels.yml) and synced
+by the [Sync Labels](.github/workflows/labels.yml) workflow.
+
+### Type labels
+
+| Label | Meaning |
+|---|---|
+| `bug` | Confirmed defect; something is broken |
+| `enhancement` | New capability or improvement to an existing one |
+| `documentation` | Change to docs only — no code |
+| `refactoring` | Code reorganization without behavior change |
+| `security` | Security-related issue or CVE |
+
+### Contribution-readiness labels
+
+| Label | Meaning |
+|---|---|
+| `good first issue` | Small, well-scoped task with clear acceptance criteria; ideal for a first PR. No prior project knowledge needed. |
+| `help wanted` | Maintainers welcome outside contributions. Also applied automatically when a stale claim is released (7-day inactivity). |
+| `Stellar Wave` | A curated batch of beginner-to-intermediate issues released periodically to grow the contributor community. Issues in a Stellar Wave are grouped by theme and announced in Discussions. |
+
+### Difficulty labels
+
+| Label | Meaning |
+|---|---|
+| `difficulty: easy` or `🟢 Beginner` | Localized change; minimal project context required |
+| `difficulty: medium` or `🟡 Intermediate` | Requires understanding one subsystem; moderate context needed |
+| `difficulty: hard` or `🔴 Advanced` | Touches multiple subsystems or requires deep domain knowledge |
+
+### Priority labels
+
+| Label | Meaning |
+|---|---|
+| `priority: critical` | Production-impacting; reviewed first; exempt from the stale-claim release |
+| `priority: high` | Should be addressed in the current sprint |
+| `priority: low` | Nice to have; no urgency |
+
+### Area labels
+
+| Label | The part of the codebase |
+|---|---|
+| `area: indexer` | `src/indexer.rs` and related polling / RPC code |
+| `area: api` | HTTP handlers, routes, and middleware (`src/handlers.rs`, `src/routes.rs`) |
+| `area: database` | Migrations, query builders, schema (`migrations/`, `src/db.rs`) |
+| `area: integrations` | Third-party integrations: Kafka, SQS, webhooks, Slack, etc. |
+| `area: sdk` | Client SDKs under `sdk/` |
+| `area: frontend` | React dashboard (`frontend/`) and dashboard (`dashboard/`) |
+| `area: infra` | Terraform, Helm, Kubernetes, Docker, CI/CD |
+| `area: docs` | Documentation under `docs/`, README, CONTRIBUTING |
+
+
 
 Integration tests require a live PostgreSQL instance. The easiest way is `make test-db`, which starts a throwaway container, runs the full suite, then tears it down:
 

@@ -320,7 +320,31 @@ jobs:
       - run: sudo apt-get install -y libpq-dev pkg-config libssl-dev cmake
       # sqlx `query!` macros are checked against the live schema at compile time.
       - run: sqlx migrate run
+      # 1. Check every feature in isolation (catches missing cfg guards).
       - run: cargo hack check --each-feature --no-dev-deps
+      # 2. Build each feature explicitly so linker errors (not caught by `check`)
+      #    are also surfaced.  These mirror the combinations described in
+      #    docs/features.md.
+      - name: Build – default features
+        run: cargo build --features "dashboard,classical-crypto"
+      - name: Build – quantum-crypto
+        run: cargo build --no-default-features --features "quantum-crypto"
+      - name: Build – hybrid-crypto
+        run: cargo build --no-default-features --features "hybrid-crypto"
+      - name: Build – istio
+        run: cargo build --no-default-features --features "classical-crypto,istio"
+      - name: Build – linkerd
+        run: cargo build --no-default-features --features "classical-crypto,linkerd"
+      - name: Build – full-observability
+        run: cargo build --no-default-features --features "classical-crypto,full-observability"
+      - name: Build – kafka
+        run: cargo build --no-default-features --features "classical-crypto,kafka"
+      - name: Build – sqs
+        run: cargo build --no-default-features --features "classical-crypto,sqs"
+      - name: Build – pubsub
+        run: cargo build --no-default-features --features "classical-crypto,pubsub"
+      - name: Build – kafka + sqs fan-out combination
+        run: cargo build --no-default-features --features "classical-crypto,kafka,sqs"
 
   test:
     name: Test (rust stable, pg ${{ matrix.postgres }})

@@ -108,6 +108,28 @@ groups:
           description: "No events indexed in the last 10 minutes. This may be expected during low-activity periods on the network, but could also indicate an indexer stall. Verify network activity and check indexer logs."
           runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/indexer-lag.md"
 
+      # #1327: RPC retention gap detection — fires when the indexed ledger sequence
+      # jumps by more than 17,000 in a single 5-minute window. A jump this large
+      # means the RPC node has rolled past its retention window and the indexer
+      # skipped ahead without indexing the missed events.
+      # 17,000 ledgers ≈ ~23.6 h at a 5-second ledger close time, just below the
+      # 17,280-ledger (~24 h) default retention window.
+      - alert: LedgerSequenceDiscontinuity
+        expr: increase(soroban_pulse_indexer_current_ledger[5m]) > 17000
+        for: 0m
+        labels:
+          severity: critical
+          component: indexer
+        annotations:
+          summary: "Soroban Pulse indexer skipped a large ledger range — possible RPC retention gap"
+          description: >-
+            The indexed ledger sequence increased by {{ $value | humanize }} in a single 5-minute
+            window. A jump larger than ~17,000 indicates the RPC node has rolled past its retention
+            window and the indexer advanced past a gap without indexing the missing events.
+            Follow the RPC retention gap runbook to determine whether to replay from Galexie or
+            accept the gap.
+          runbook_url: "https://github.com/Soroban-Pulse/SorobanPulse/blob/main/docs/runbooks/rpc-retention-gap.md"
+
       - alert: HTTPRequestLatencyHigh
         expr: histogram_quantile(0.95, rate(soroban_pulse_http_request_duration_seconds_bucket[5m])) > 1
         for: 5m

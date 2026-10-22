@@ -21,14 +21,28 @@ Closes #<!-- issue number -->
 
 -
 
+## How to Test This
+
+<!--
+  Tell reviewers exactly how to verify your change works.
+  Include specific commands, API calls, or UI steps.
+  Example:
+    1. Apply the migration: `sqlx migrate run`
+    2. Run the indexer: `make run`
+    3. Call `GET /v1/events?event_type=contract` and confirm the filter works.
+  If no manual steps are needed (e.g. doc-only change), write: "N/A — docs-only change."
+-->
+
+1.
+
 ## Testing
 
-<!-- Describe how you tested this. -->
+<!-- Describe automated tests you added or modified. -->
 
 - [ ] `make test` passes
 - [ ] `make lint` (fmt + clippy) reports no warnings
 - [ ] Required CI checks are green (see CONTRIBUTING.md → "Pull Requests")
-- [ ] Manually tested locally
+- [ ] Manually tested locally (describe steps in "How to Test This" above)
 
 ## Security Considerations
 
