@@ -169,6 +169,28 @@ The application reads `DATABASE_URL` from an environment variable. In ECS, injec
 
 ---
 
+### Sizing variables for multi-replica deployments
+
+These root-module variables interact with the application's connection pool.
+Derive them from the formulas in
+[Capacity Planning → Multi-replica sizing](capacity-planning.md#multi-replica-sizing).
+
+| Variable | Default | Formula / rule |
+|----------|---------|----------------|
+| `app_container_count` (`N`) | `2` | Primary connections `C_primary = N × DB_MAX_CONNECTIONS`. During a rolling deploy `C_peak = ceil(2 × N) × DB_MAX_CONNECTIONS` (the ECS module sets `deployment_maximum_percent = 200`). |
+| `db_instance_class` | `db.t3.medium` | Sets PostgreSQL `max_connections` `M = LEAST(DBInstanceClassMemory / 9531392, 5000)` (≈ 410 for `db.t3.medium`). Require `C_peak ≤ 0.8 × (M − 10)`. |
+| `ecs_task_cpu` | `512` | Every task can become the indexer leader, so size for leader CPU, not the standby baseline. |
+| `ecs_task_memory` | `1024` | Same as a single instance: pool memory grows only slightly with `DB_MAX_CONNECTIONS`. |
+
+`DB_MAX_CONNECTIONS` is an application setting (default `10`). The
+Terraform module does not set it. To override it, add it to
+`environment_variables` in `module "ecs"` (`terraform/main.tf`).
+
+With the defaults (`N = 2`, `DB_MAX_CONNECTIONS = 10`, `db.t3.medium`),
+`C_peak = 40`, well within the budget of `0.8 × (410 − 10) = 320`.
+
+---
+
 ### `modules/alb`
 
 Creates an HTTPS-terminating Application Load Balancer.
