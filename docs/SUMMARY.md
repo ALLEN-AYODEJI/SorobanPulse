@@ -19,6 +19,7 @@
 
 - [API Usage](api-usage.md)
 - [API Versioning](api-versioning.md)
+  - [Migrating unversioned routes to /v1/](migration-unversioned-to-v1.md)
 - [API SLA](api-sla.md)
 - [GraphQL API](graphql_api.md)
 - [OpenAPI Spec](codegen.md)
