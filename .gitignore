@@ -142,3 +142,6 @@ docs/site/node_modules/
 docs/site/build/
 docs/site/.docusaurus/
 docs/site/static/openapi.json
+
+# AI tool runtime / session state (specs are committed; agents/ is ephemeral)
+.kiro/agents/

@@ -173,6 +173,7 @@
 ### Configuration
 
 - [Configuration Management](../configuration-management.md)
+- [Cargo Feature Matrix](../features.md)
 - [Feature Flags](../feature-flags.md)
 - [Feature Flag Rollback Automation](../feature-flag-rollback.md)
 - [Secret Management and Secrets Scanning](../secret-management.md)
@@ -267,6 +268,7 @@
 - [Feature Flag Rollback Troubleshooting](../runbooks/feature-flag-rollback.md)
 - [Runbook: Query Plan Cache](../runbooks/query-plan-cache.md)
 - [Runbook: Schema Consolidation](../runbooks/schema-consolidation.md)
+- [Runbook: RPC Retention Gap](../runbooks/rpc-retention-gap.md)
 - [Emergency Runbooks](../emergency-runbooks/README.md)
   - [Runbook: Security Breach Response](../emergency-runbooks/security-breach-response.md)
   - [Runbook: Database Corruption Recovery](../emergency-runbooks/database-corruption-recovery.md)
@@ -297,6 +299,7 @@
 ## Contributing
 
 - [Module Map](../module-map.md)
+- [Archive: Implementation Reports](../archive/README.md)
 
 ### Architecture Decisions
 
