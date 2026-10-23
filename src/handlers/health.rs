@@ -51,7 +51,7 @@ pub(super) async fn build_health_response(state: &AppState) -> (StatusCode, Valu
             "db": db_status,
         });
         // Merge indexer status
-        let mut obj = serde_json::to_value(response).unwrap();
+        let mut obj = response;
         if let Value::Object(ref mut map) = obj {
             if let Value::Object(indexer_map) = indexer_status {
                 map.extend(indexer_map);
@@ -272,10 +272,10 @@ pub async fn health_external(
 pub async fn get_pool_health(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    crate::pool_management::check_pool_health(
+    crate::db_pool::management::check_pool_health(
         &state.db,
         state.pool_stats.clone(),
-        state.config.db.max_connections,
+        state.config.db_max_connections,
         0.9,
     )
     .await

@@ -442,8 +442,7 @@ pub async fn stream_events_multi(
 
     // DB fallback for multi-stream when ring buffer misses.
     let db_replay_multi: Vec<crate::models::Event> =
-        if last_event_id.is_some() && ring_replay_multi.is_empty() {
-            let last_id = last_event_id.unwrap();
+        if let (Some(last_id), true) = (last_event_id.clone(), ring_replay_multi.is_empty()) {
             let base_offset = 2usize;
             let placeholders: String = ids
                 .iter()
@@ -814,8 +813,9 @@ pub(super) async fn stream_events_internal(
 
     // DB fallback replay when ring buffer miss occurs (last_event_id set but ring returned empty
     // because of eviction). Also used when ring buffer is disabled.
-    let db_replay: Vec<crate::models::Event> = if last_event_id.is_some() && ring_replay.is_empty() {
-        let last_id = last_event_id.unwrap();
+    let db_replay: Vec<crate::models::Event> = if let (Some(last_id), true) =
+        (last_event_id.clone(), ring_replay.is_empty())
+    {
         let q = if let Some(ref cid) = contract_filter {
             sqlx::query_as::<_, crate::models::Event>(
                 "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, event_data_normalized, created_at, schema_version, 0::bigint AS total_count \
@@ -1437,7 +1437,10 @@ pub async fn get_events(
             q = q.bind(serde_json::json!(t3).to_string());
         }
         if let Some(ref data_pattern) = params.data_pattern {
-            let expr = format_jsonpath_filter(data_pattern, params.pattern.as_ref().unwrap());
+            let pattern = params.pattern.as_deref().ok_or_else(|| {
+                AppError::Validation("pattern is required when data_pattern is set".to_string())
+            })?;
+            let expr = format_jsonpath_filter(data_pattern, pattern);
             q = q.bind(expr);
         }
         if let Some(ref search) = params.search {
@@ -1479,8 +1482,7 @@ pub async fn get_events(
         drop(_db_span);
 
         let has_more = rows.len() as i64 == limit;
-        let next_cursor = if has_more {
-            let last = rows.last().unwrap();
+        let next_cursor = if let (true, Some(last)) = (has_more, rows.last()) {
             let last_id: uuid::Uuid = last.try_get("id")?;
             let last_val_text = match sort_by {
                 crate::models::SortBy::Ledger => {
@@ -1533,7 +1535,7 @@ pub async fn get_events(
                         .header("ETag", tag.as_str())
                         .header("Cache-Control", "no-cache")
                         .body(axum::body::Body::empty())
-                        .unwrap();
+                        .unwrap_or_else(|e| response_build_error(e));
                     return Ok(resp.into_response());
                 }
             }
@@ -1543,9 +1545,7 @@ pub async fn get_events(
         if want_ndjson {
             let mut resp = ndjson_response(events.into_iter()).into_response();
             if let Some(ref tag) = etag {
-                resp.headers_mut().insert("ETag", tag.parse().unwrap());
-                resp.headers_mut()
-                    .insert("Cache-Control", "no-cache".parse().unwrap());
+                insert_etag_headers(resp.headers_mut(), tag);
             }
             return Ok(resp);
         }
@@ -1557,9 +1557,7 @@ pub async fn get_events(
             "limit": limit,
         }));
         if let Some(ref tag) = etag {
-            resp.headers_mut().insert("ETag", tag.parse().unwrap());
-            resp.headers_mut()
-                .insert("Cache-Control", "no-cache".parse().unwrap());
+            insert_etag_headers(resp.headers_mut(), tag);
         }
         if compact_mode {
             resp.headers_mut().insert(
@@ -1768,8 +1766,7 @@ pub async fn get_events(
     drop(_db_span);
 
     let has_more = rows.len() as i64 == limit;
-    let next_cursor = if has_more {
-        let last = rows.last().unwrap();
+    let next_cursor = if let (true, Some(last)) = (has_more, rows.last()) {
         let last_id: uuid::Uuid = last.try_get("id")?;
         let last_val_text = match sort_by {
             crate::models::SortBy::Ledger => {
@@ -1900,7 +1897,7 @@ pub async fn get_events(
                     .header("ETag", tag.as_str())
                     .header("Cache-Control", "no-cache")
                     .body(axum::body::Body::empty())
-                    .unwrap();
+                    .unwrap_or_else(|e| response_build_error(e));
                 return Ok(resp.into_response());
             }
         }
@@ -1916,7 +1913,7 @@ pub async fn get_events(
         "pagination": "offset — migrate to cursor parameter for better performance",
     });
 
-    let mut body_obj = body.as_object().unwrap().clone();
+    let mut body_obj = body.as_object().cloned().unwrap_or_default();
     
     // Add approximation metadata when using approximate count
     if approximate {
@@ -1949,10 +1946,7 @@ pub async fn get_events(
 
     let mut response = Json(body).into_response();
     if let Some(ref tag) = etag {
-        response.headers_mut().insert("ETag", tag.parse().unwrap());
-        response
-            .headers_mut()
-            .insert("Cache-Control", "no-cache".parse().unwrap());
+        insert_etag_headers(response.headers_mut(), tag);
     }
     if params.compact.unwrap_or(false) {
         response.headers_mut().insert(
@@ -2284,22 +2278,10 @@ pub async fn export_events(
         let mut body: Vec<u8> = jsonl.into_bytes();
         let mut content_encoding = None;
         if use_gzip {
-            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
-            body = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            body = compress_gzip(&body).await?;
             content_encoding = Some("gzip");
         } else if use_br {
-            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
-            body = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            body = compress_brotli(&body).await?;
             content_encoding = Some("br");
         }
         let mut builder = Response::builder()
@@ -2310,7 +2292,7 @@ pub async fn export_events(
         if let Some(enc) = content_encoding {
             builder = builder.header(header::CONTENT_ENCODING, enc);
         }
-        return Ok(builder.body(Body::from(body)).unwrap());
+        return Ok(builder.body(Body::from(body)).unwrap_or_else(|e| response_build_error(e)));
     }
 
     #[cfg(feature = "parquet")]
@@ -2337,23 +2319,11 @@ pub async fn export_events(
         let mut content_encoding = None;
         let mut filename = "events.parquet";
         if use_gzip {
-            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(bytes.as_slice());
-            bytes = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            bytes = compress_gzip(&bytes).await?;
             content_encoding = Some("gzip");
             filename = "events.parquet.gz";
         } else if use_br {
-            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(bytes.as_slice());
-            bytes = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            bytes = compress_brotli(&bytes).await?;
             content_encoding = Some("br");
             filename = "events.parquet.br";
         }
@@ -2365,7 +2335,7 @@ pub async fn export_events(
         if let Some(enc) = content_encoding {
             builder = builder.header(header::CONTENT_ENCODING, enc);
         }
-        return Ok(builder.body(Body::from(bytes)).unwrap());
+        return Ok(builder.body(Body::from(bytes)).unwrap_or_else(|e| response_build_error(e)));
     }
 
     // Default: CSV (RFC 4180)
@@ -2423,23 +2393,11 @@ pub async fn export_events(
     let mut content_encoding = None;
     let mut filename = "events.csv";
     if use_gzip {
-        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
-        body = tokio::runtime::Handle::current().block_on(async {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            encoder.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
+        body = compress_gzip(&body).await?;
         content_encoding = Some("gzip");
         filename = "events.csv.gz";
     } else if use_br {
-        let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
-        body = tokio::runtime::Handle::current().block_on(async {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            encoder.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
+        body = compress_brotli(&body).await?;
         content_encoding = Some("br");
         filename = "events.csv.br";
     }
@@ -2451,7 +2409,7 @@ pub async fn export_events(
     if let Some(enc) = content_encoding {
         builder = builder.header(header::CONTENT_ENCODING, enc);
     }
-    Ok(builder.body(Body::from(body)).unwrap())
+    Ok(builder.body(Body::from(body)).unwrap_or_else(|e| response_build_error(e)))
 }
 
 #[utoipa::path(
@@ -2513,7 +2471,7 @@ pub async fn get_recent_events(
     };
 
     let query_str = format!(
-        "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, schema_version, 0::bigint AS total_count \
+        "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, created_at, schema_version, asset_code, asset_issuer, 0::bigint AS total_count \
          FROM events {} ORDER BY ledger DESC, id DESC LIMIT ${}",
         where_clause, bind_idx,
     );
@@ -3391,7 +3349,7 @@ pub async fn get_events_diff(
             to_ledger: params.to_ledger,
             contracts,
         })
-        .unwrap(),
+        .map_err(|e| AppError::Internal(format!("serialization error: {e}")))?,
     ))
 }
 

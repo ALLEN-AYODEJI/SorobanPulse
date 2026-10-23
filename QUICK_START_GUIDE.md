@@ -461,7 +461,7 @@ tokio::spawn(run_trace_log_cleanup(pool.clone(), 90));
 → Read: `WEBHOOK_DELIVERY_IMPROVEMENT_SPEC.md`
 
 ### For Implementation Details
-→ Read: `IMPLEMENTATION_GUIDE.md`
+→ Read: `docs/archive/IMPLEMENTATION_GUIDE.md`
 
 ### For Testing Strategy
 → Read: `TESTING_AND_VALIDATION.md`
