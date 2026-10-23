@@ -38,7 +38,7 @@ pub async fn download_export_job(Path(job_id): Path<String>) -> impl IntoRespons
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_DISPOSITION, format!("attachment; filename=\"export_{job_id}.bin\""))
         .body(Body::from(data.as_slice()))
-        .unwrap()
+        .unwrap_or_else(|e| response_build_error(e))
 }
 
 /// Start an import job (stub)
@@ -166,7 +166,8 @@ fn validate_jsonpath_expr(expr: &str) -> Result<(), AppError> {
         ));
     }
 
-    let path_re = Regex::new(r"^\$(?:\.[A-Za-z_][A-Za-z0-9_]*|\['[A-Za-z0-9_]+\'])*$").unwrap();
+    let path_re = Regex::new(r"^\$(?:\.[A-Za-z_][A-Za-z0-9_]*|\['[A-Za-z0-9_]+\'])*$")
+        .map_err(|e| AppError::Internal(format!("invalid JSONPath validator regex: {e}")))?;
     if !path_re.is_match(expr) {
         return Err(AppError::Validation(
             "data_pattern must be a simple JSONPath expression like $.amount".to_string(),
@@ -183,6 +184,46 @@ fn validate_regex_pattern(pattern: &str) -> Result<(), AppError> {
     }
     Regex::new(pattern).map_err(|_| AppError::Validation("pattern is not a valid regular expression".to_string()))?;
     Ok(())
+}
+
+/// Fallback for a `Response::builder()` that failed (only possible with an
+/// invalid header value, e.g. one derived from user input): log and return 500
+/// instead of panicking (issue #1246).
+fn response_build_error(e: axum::http::Error) -> Response<Body> {
+    tracing::error!(error = %e, "Failed to build HTTP response");
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// Attach `ETag` + `Cache-Control: no-cache`, skipping an ETag that is not a
+/// valid header value rather than panicking.
+fn insert_etag_headers(headers: &mut HeaderMap, tag: &str) {
+    if let Ok(value) = axum::http::HeaderValue::from_str(tag) {
+        headers.insert("ETag", value);
+    }
+    headers.insert("Cache-Control", axum::http::HeaderValue::from_static("no-cache"));
+}
+
+/// Gzip an in-memory buffer. Replaces a `Handle::block_on` + `unwrap()` that
+/// panicked when called from inside the async runtime (issue #1246).
+async fn compress_gzip(input: &[u8]) -> Result<Vec<u8>, AppError> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    async_compression::tokio::bufread::GzipEncoder::new(input)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| AppError::Internal(format!("gzip error: {e}")))?;
+    Ok(buf)
+}
+
+/// Brotli-compress an in-memory buffer. See [`compress_gzip`].
+async fn compress_brotli(input: &[u8]) -> Result<Vec<u8>, AppError> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    async_compression::tokio::bufread::BrotliEncoder::new(input)
+        .read_to_end(&mut buf)
+        .await
+        .map_err(|e| AppError::Internal(format!("brotli error: {e}")))?;
+    Ok(buf)
 }
 
 fn format_jsonpath_filter(path: &str, pattern: &str) -> String {
@@ -323,14 +364,14 @@ fn client_ip_from_headers(headers: &HeaderMap) -> String {
 
 /// Build a `429 Too Many Requests` response with a `Retry-After` header.
 fn too_many_requests(retry_after_secs: u64, message: &str) -> Response {
-    Response::builder()
-        .status(StatusCode::TOO_MANY_REQUESTS)
-        .header(header::RETRY_AFTER, retry_after_secs.to_string())
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            json!({ "error": message, "retry_after": retry_after_secs }).to_string(),
-        ))
-        .unwrap()
+    let mut response = Response::new(Body::from(
+        json!({ "error": message, "retry_after": retry_after_secs }).to_string(),
+    ));
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    let headers = response.headers_mut();
+    headers.insert(header::RETRY_AFTER, header::HeaderValue::from(retry_after_secs));
+    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+    response
 }
 
 /// Simple in-process cache entry for the contracts list.
@@ -675,7 +716,7 @@ async fn build_health_response(state: &AppState) -> (StatusCode, Value) {
             "db": db_status,
         });
         // Merge indexer status
-        let mut obj = serde_json::to_value(response).unwrap();
+        let mut obj = response;
         if let Value::Object(ref mut map) = obj {
             if let Value::Object(indexer_map) = indexer_status {
                 map.extend(indexer_map);
@@ -833,7 +874,7 @@ pub async fn unsubscribe(
             .status(status)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
             .body(Body::from(body))
-            .expect("static html response is always valid")
+            .unwrap_or_else(|e| response_build_error(e))
     }
 
     // Verify the HMAC-signed, time-limited token (issue #1158).
@@ -1384,11 +1425,11 @@ body{background:var(--sp-bg)!important;color:var(--sp-text)!important;font-famil
     let script = r##"SwaggerUIBundle({url:"/openapi.json",dom_id:"#swagger-ui",deepLinking:true,presets:[SwaggerUIBundle.presets.apis,SwaggerUIBundle.SwaggerUIStandalonePreset],layout:"BaseLayout",docExpansion:"list",defaultModelsExpandDepth:1})"##;
 
     // SorobanPulse logo — inline SVG, no external fetch required
-    let logo_svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" fill="none" aria-hidden="true">
+    let logo_svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" fill="none" aria-hidden="true">
   <circle cx="18" cy="18" r="18" fill="#7c3aed"/>
   <path d="M10 18 Q18 8 26 18 Q18 28 10 18Z" fill="#a78bfa"/>
   <circle cx="18" cy="18" r="4" fill="#0f1117"/>
-</svg>"#;
+</svg>"##;
 
     let html = format!(
         r#"<!DOCTYPE html>
@@ -1642,8 +1683,7 @@ pub async fn stream_events_multi(
 
     // DB fallback for multi-stream when ring buffer misses.
     let db_replay_multi: Vec<crate::models::Event> =
-        if last_event_id.is_some() && ring_replay_multi.is_empty() {
-            let last_id = last_event_id.unwrap();
+        if let (Some(last_id), true) = (last_event_id.clone(), ring_replay_multi.is_empty()) {
             let base_offset = 2usize;
             let placeholders: String = ids
                 .iter()
@@ -2014,8 +2054,9 @@ async fn stream_events_internal(
 
     // DB fallback replay when ring buffer miss occurs (last_event_id set but ring returned empty
     // because of eviction). Also used when ring buffer is disabled.
-    let db_replay: Vec<crate::models::Event> = if last_event_id.is_some() && ring_replay.is_empty() {
-        let last_id = last_event_id.unwrap();
+    let db_replay: Vec<crate::models::Event> = if let (Some(last_id), true) =
+        (last_event_id.clone(), ring_replay.is_empty())
+    {
         let q = if let Some(ref cid) = contract_filter {
             sqlx::query_as::<_, crate::models::Event>(
                 "SELECT id, contract_id, event_type, tx_hash, ledger, timestamp, event_data, event_data_normalized, created_at, schema_version, 0::bigint AS total_count \
@@ -2333,7 +2374,7 @@ fn json_response(body: Value) -> Response<Body> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap_or_default()))
-        .unwrap()
+        .unwrap_or_else(|e| response_build_error(e))
 }
 
 /// Build an NDJSON response: one JSON object per line, no wrapping array.
@@ -2347,7 +2388,7 @@ fn ndjson_response(events: impl Iterator<Item = Value>) -> Response<Body> {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/x-ndjson")
         .body(Body::from(buf))
-        .unwrap()
+        .unwrap_or_else(|e| response_build_error(e))
 }
 
 #[utoipa::path(
@@ -2762,7 +2803,10 @@ pub async fn get_events(
             q = q.bind(serde_json::json!(t3).to_string());
         }
         if let Some(ref data_pattern) = params.data_pattern {
-            let expr = format_jsonpath_filter(data_pattern, params.pattern.as_ref().unwrap());
+            let pattern = params.pattern.as_deref().ok_or_else(|| {
+                AppError::Validation("pattern is required when data_pattern is set".to_string())
+            })?;
+            let expr = format_jsonpath_filter(data_pattern, pattern);
             q = q.bind(expr);
         }
         if let Some(ref search) = params.search {
@@ -2804,8 +2848,7 @@ pub async fn get_events(
         drop(_db_span);
 
         let has_more = rows.len() as i64 == limit;
-        let next_cursor = if has_more {
-            let last = rows.last().unwrap();
+        let next_cursor = if let (true, Some(last)) = (has_more, rows.last()) {
             let last_id: uuid::Uuid = last.try_get("id")?;
             let last_val_text = match sort_by {
                 crate::models::SortBy::Ledger => {
@@ -2858,7 +2901,7 @@ pub async fn get_events(
                         .header("ETag", tag.as_str())
                         .header("Cache-Control", "no-cache")
                         .body(axum::body::Body::empty())
-                        .unwrap();
+                        .unwrap_or_else(|e| response_build_error(e));
                     return Ok(resp.into_response());
                 }
             }
@@ -2868,9 +2911,7 @@ pub async fn get_events(
         if want_ndjson {
             let mut resp = ndjson_response(events.into_iter()).into_response();
             if let Some(ref tag) = etag {
-                resp.headers_mut().insert("ETag", tag.parse().unwrap());
-                resp.headers_mut()
-                    .insert("Cache-Control", "no-cache".parse().unwrap());
+                insert_etag_headers(resp.headers_mut(), tag);
             }
             return Ok(resp);
         }
@@ -2882,9 +2923,7 @@ pub async fn get_events(
             "limit": limit,
         }));
         if let Some(ref tag) = etag {
-            resp.headers_mut().insert("ETag", tag.parse().unwrap());
-            resp.headers_mut()
-                .insert("Cache-Control", "no-cache".parse().unwrap());
+            insert_etag_headers(resp.headers_mut(), tag);
         }
         if compact_mode {
             resp.headers_mut().insert(
@@ -3093,8 +3132,7 @@ pub async fn get_events(
     drop(_db_span);
 
     let has_more = rows.len() as i64 == limit;
-    let next_cursor = if has_more {
-        let last = rows.last().unwrap();
+    let next_cursor = if let (true, Some(last)) = (has_more, rows.last()) {
         let last_id: uuid::Uuid = last.try_get("id")?;
         let last_val_text = match sort_by {
             crate::models::SortBy::Ledger => {
@@ -3225,7 +3263,7 @@ pub async fn get_events(
                     .header("ETag", tag.as_str())
                     .header("Cache-Control", "no-cache")
                     .body(axum::body::Body::empty())
-                    .unwrap();
+                    .unwrap_or_else(|e| response_build_error(e));
                 return Ok(resp.into_response());
             }
         }
@@ -3241,7 +3279,7 @@ pub async fn get_events(
         "pagination": "offset — migrate to cursor parameter for better performance",
     });
 
-    let mut body_obj = body.as_object().unwrap().clone();
+    let mut body_obj = body.as_object().cloned().unwrap_or_default();
     
     // Add approximation metadata when using approximate count
     if approximate {
@@ -3274,10 +3312,7 @@ pub async fn get_events(
 
     let mut response = Json(body).into_response();
     if let Some(ref tag) = etag {
-        response.headers_mut().insert("ETag", tag.parse().unwrap());
-        response
-            .headers_mut()
-            .insert("Cache-Control", "no-cache".parse().unwrap());
+        insert_etag_headers(response.headers_mut(), tag);
     }
     if params.compact.unwrap_or(false) {
         response.headers_mut().insert(
@@ -3423,7 +3458,7 @@ fn xml_response(body: String) -> Response {
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/atom+xml; charset=utf-8")
         .body(Body::from(body))
-        .unwrap()
+        .unwrap_or_else(|e| response_build_error(e))
 }
 
 fn render_atom_feed(rows: &[sqlx::postgres::PgRow]) -> Result<String, AppError> {
@@ -3684,22 +3719,10 @@ pub async fn export_events(
         let mut body: Vec<u8> = jsonl.into_bytes();
         let mut content_encoding = None;
         if use_gzip {
-            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
-            body = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            body = compress_gzip(&body).await?;
             content_encoding = Some("gzip");
         } else if use_br {
-            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
-            body = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            body = compress_brotli(&body).await?;
             content_encoding = Some("br");
         }
         let mut builder = Response::builder()
@@ -3710,7 +3733,7 @@ pub async fn export_events(
         if let Some(enc) = content_encoding {
             builder = builder.header(header::CONTENT_ENCODING, enc);
         }
-        return Ok(builder.body(Body::from(body)).unwrap());
+        return Ok(builder.body(Body::from(body)).unwrap_or_else(|e| response_build_error(e)));
     }
 
     #[cfg(feature = "parquet")]
@@ -3737,23 +3760,11 @@ pub async fn export_events(
         let mut content_encoding = None;
         let mut filename = "events.parquet";
         if use_gzip {
-            let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(bytes.as_slice());
-            bytes = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            bytes = compress_gzip(&bytes).await?;
             content_encoding = Some("gzip");
             filename = "events.parquet.gz";
         } else if use_br {
-            let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(bytes.as_slice());
-            bytes = tokio::runtime::Handle::current().block_on(async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                encoder.read_to_end(&mut buf).await.unwrap();
-                buf
-            });
+            bytes = compress_brotli(&bytes).await?;
             content_encoding = Some("br");
             filename = "events.parquet.br";
         }
@@ -3765,7 +3776,7 @@ pub async fn export_events(
         if let Some(enc) = content_encoding {
             builder = builder.header(header::CONTENT_ENCODING, enc);
         }
-        return Ok(builder.body(Body::from(bytes)).unwrap());
+        return Ok(builder.body(Body::from(bytes)).unwrap_or_else(|e| response_build_error(e)));
     }
 
     // Default: CSV (RFC 4180)
@@ -3823,23 +3834,11 @@ pub async fn export_events(
     let mut content_encoding = None;
     let mut filename = "events.csv";
     if use_gzip {
-        let mut encoder = async_compression::tokio::bufread::GzipEncoder::new(body.as_slice());
-        body = tokio::runtime::Handle::current().block_on(async {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            encoder.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
+        body = compress_gzip(&body).await?;
         content_encoding = Some("gzip");
         filename = "events.csv.gz";
     } else if use_br {
-        let mut encoder = async_compression::tokio::bufread::BrotliEncoder::new(body.as_slice());
-        body = tokio::runtime::Handle::current().block_on(async {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            encoder.read_to_end(&mut buf).await.unwrap();
-            buf
-        });
+        body = compress_brotli(&body).await?;
         content_encoding = Some("br");
         filename = "events.csv.br";
     }
@@ -3851,7 +3850,7 @@ pub async fn export_events(
     if let Some(enc) = content_encoding {
         builder = builder.header(header::CONTENT_ENCODING, enc);
     }
-    Ok(builder.body(Body::from(body)).unwrap())
+    Ok(builder.body(Body::from(body)).unwrap_or_else(|e| response_build_error(e)))
 }
 
 /// Query parameters for the /v1/events/recent endpoint.
@@ -5067,7 +5066,7 @@ pub async fn get_cost_report(
 pub async fn get_pool_statistics(
     State(state): State<AppState>,
 ) -> Result<Json<crate::models::PoolStatistics>, (StatusCode, Json<Value>)> {
-    crate::pool_management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db.max_connections)
+    crate::db_pool::management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db_max_connections)
         .await
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))
@@ -5086,12 +5085,12 @@ pub async fn get_pool_statistics(
 pub async fn get_pool_tuning_guide(
     State(state): State<AppState>,
 ) -> Result<Json<crate::models::PoolTuningGuide>, (StatusCode, Json<Value>)> {
-    let pool_stats = crate::pool_management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db.max_connections)
+    let pool_stats = crate::db_pool::management::get_pool_config(&state.db, state.pool_stats.clone(), state.config.db_max_connections)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))))?;
 
     let current_config = crate::models::PoolConfig {
-        max_connections: state.config.db.max_connections,
+        max_connections: state.config.db_max_connections,
         min_connections: state.config.db.min_connections.unwrap_or(1),
         connection_timeout_secs: 30,
         idle_timeout_secs: 600,
@@ -5099,7 +5098,7 @@ pub async fn get_pool_tuning_guide(
         sample_interval_secs: 15,
     };
 
-    let guide = crate::pool_management::generate_tuning_guide(&pool_stats, &current_config);
+    let guide = crate::db_pool::management::generate_tuning_guide(&pool_stats, &current_config);
     Ok(Json(guide))
 }
 
@@ -5116,10 +5115,10 @@ pub async fn get_pool_tuning_guide(
 pub async fn get_pool_health(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    crate::pool_management::check_pool_health(
+    crate::db_pool::management::check_pool_health(
         &state.db,
         state.pool_stats.clone(),
-        state.config.db.max_connections,
+        state.config.db_max_connections,
         0.9,
     )
     .await
@@ -5687,7 +5686,7 @@ pub async fn get_events_diff(
             to_ledger: params.to_ledger,
             contracts,
         })
-        .unwrap(),
+        .map_err(|e| AppError::Internal(format!("serialization error: {e}")))?,
     ))
 }
 
@@ -15779,7 +15778,7 @@ pub async fn record_slo_sample(
 pub async fn get_adaptive_pool_status(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let status = crate::adaptive_pool::AdaptivePoolStatus::from_state(&state.adaptive_pool);
+    let status = crate::db_pool::adaptive::AdaptivePoolStatus::from_state(&state.adaptive_pool);
     Ok(Json(serde_json::to_value(&status).unwrap_or_else(|_| json!({"error": "serialization failed"}))))
 }
 
@@ -15791,7 +15790,7 @@ pub async fn get_adaptive_pool_status(
 /// Body: JSON matching `AdaptivePoolConfig`.
 pub async fn update_adaptive_pool_config(
     State(state): State<AppState>,
-    Json(new_config): Json<crate::adaptive_pool::AdaptivePoolConfig>,
+    Json(new_config): Json<crate::db_pool::adaptive::AdaptivePoolConfig>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     state.adaptive_pool.apply_config(new_config).map_err(|e| {
         (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e })))
@@ -16483,8 +16482,6 @@ pub async fn analyze_causality(
         "related": causality.is_some()
     })))
 }
-++ b/src/main.rs
-mod cross_chain_correlation;
 #[utoipa::path(
     get,
     path = "/v1/features",
@@ -16533,16 +16530,6 @@ pub async fn get_feature_flag_status(
         }
     })))
 }
-++ b/src/metrics.rs
-// ── Issue #630: Resource utilization metrics ────────────────────────────────
-
-/// Update file descriptor count gauge
-pub fn update_fd_count(count: u64) {
-    m::gauge!("soroban_pulse_fd_count").set(count as f64);
-}
-
-/// Update disk I/O read bytes gauge
-pub fn update_disk_read_bytes(bytes: u64) {
 /// Webhook that receives email bounce notifications from SendGrid, AWS SES
 /// (including SNS-wrapped notifications) and Mailgun (Issue #484). Bounced
 /// addresses are persisted so future notifications skip them.

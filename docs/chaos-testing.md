@@ -222,7 +222,7 @@ rendered metrics text is settled, but no chaos test does it yet.
 |---|---|
 | Chaos test framework for network partitions | ✅ `tests/resilience/mod.rs`, `tests/chaos_tests.rs` |
 | Database failure simulations | ⚠️ Partial — duplicate/idempotency and large-batch behavior are covered; a true connection-loss-mid-query simulation is not |
-| Connection pool exhaustion tests | ❌ Not yet a chaos scenario. `src/connection_pool.rs` tracks exhaustion (`soroban_pulse_db_pool_exhaustion_alerts_total`, `DBPoolExhaustion` alert in `docs/alerts.yml`) but there's no test that drives the pool to exhaustion and asserts on recovery |
+| Connection pool exhaustion tests | ❌ Not yet a chaos scenario. `src/db_pool/monitor.rs` tracks exhaustion (`soroban_pulse_db_pool_exhaustion_alerts_total`, `DBPoolExhaustion` alert in `docs/alerts.yml`) but there's no test that drives the pool to exhaustion and asserts on recovery |
 | Delayed response scenarios | ✅ `chaos_network_latency_*` |
 | Partial failure injection | ✅ `chaos_rpc_intermittent_faults`, `chaos_error_then_empty_success_no_data_loss` |
 | Metrics collection during chaos tests | ⚠️ Metrics pipeline is live in the relevant tests but not yet asserted on — see above |

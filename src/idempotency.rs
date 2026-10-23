@@ -281,20 +281,20 @@ pub async fn idempotency_middleware(
     let bytes = match to_bytes(body, 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
-            return Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from("request body too large"))
-                .unwrap();
+            let mut response = Response::new(Body::from("request body too large"));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            return response;
         }
     };
     let request_hash = hash_body(&bytes);
 
     if let Some(cached) = state.store.get(&key) {
-        return Response::builder()
-            .status(StatusCode::from_u16(cached.status_code).unwrap_or(StatusCode::OK))
-            .header("idempotent-replayed", "true")
-            .body(Body::from(cached.body))
-            .unwrap();
+        let mut response = Response::new(Body::from(cached.body));
+        *response.status_mut() = StatusCode::from_u16(cached.status_code).unwrap_or(StatusCode::OK);
+        response
+            .headers_mut()
+            .insert("idempotent-replayed", header::HeaderValue::from_static("true"));
+        return response;
     }
 
     let req = Request::from_parts(parts, Body::from(bytes));

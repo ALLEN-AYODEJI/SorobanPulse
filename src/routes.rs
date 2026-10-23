@@ -133,9 +133,9 @@ pub struct AppState {
     /// Issue #618: Anonymization rules configuration.
     pub anonymization_config: Option<Arc<crate::anonymization::AnonymizationConfig>>,
     /// Issue #817: Connection pool stats tracker (shared with pool monitor).
-    pub pool_stats: Arc<crate::connection_pool::PoolStats>,
+    pub pool_stats: Arc<crate::db_pool::PoolStats>,
     /// Issue #817: Adaptive pool tuner — hot-reloadable config, snapshots, counters.
-    pub adaptive_pool: Arc<crate::adaptive_pool::AdaptiveTunerState>,
+    pub adaptive_pool: Arc<crate::db_pool::AdaptiveTunerState>,
     /// Issue #817: Alias so handlers can use `state.db` (same as `state.pool`).
     pub db: sqlx::PgPool,
     /// Issue #879: Circuit breaker manager for webhook endpoints.
@@ -482,22 +482,12 @@ pub fn create_router_with_tx_and_tenant_map(
         config.query_cache_max_capacity,
     );
 
-    // Issue #817: spawn pool monitor and adaptive tuner.
-    let pool_stats = {
-        let pool_cfg = crate::connection_pool::PoolMonitorConfig {
-            max_connections: config.db_max_connections,
-            min_connections: config.db_min_connections,
-            exhaustion_threshold: 0.9,
-            sample_interval: std::time::Duration::from_secs(15),
-        };
-        crate::connection_pool::spawn_pool_monitor(pool.clone(), pool_cfg)
-    };
-    let adaptive_pool = crate::adaptive_pool::spawn_adaptive_monitor(
-        pool.clone(),
-        crate::adaptive_pool::AdaptivePoolConfig::default(),
-        config.db_max_connections,
-        config.db_min_connections,
-    );
+    // Issue #817 / #1244: monitors are started once by `db_pool::DbPool::init`;
+    // the router only shares their handles.
+    let crate::db_pool::PoolMonitors {
+        stats: pool_stats,
+        adaptive: adaptive_pool,
+    } = crate::db_pool::monitors();
 
     let circuit_breaker_manager = crate::webhook_circuit_breaker::CircuitBreakerManager::new(
         crate::webhook_circuit_breaker::CircuitBreakerConfig::default()
@@ -571,7 +561,9 @@ pub fn create_router_with_tx_and_tenant_map(
     // Build governor config: burst = rate_limit_per_minute, replenish 1 token per (60/rate) seconds.
     // per_second(n) means n tokens replenished per second; we want rate_limit_per_minute / 60.
     // Use per_millisecond to avoid integer truncation: replenish 1 token every (60_000 / rate) ms.
-    let replenish_ms = 60_000u64 / u64::from(rate_limit_per_minute.max(1));
+    // Clamp to >= 1 ms: a zero period makes `GovernorConfigBuilder::finish`
+    // return `None` (limits above 60 000/min would otherwise round to 0).
+    let replenish_ms = (60_000u64 / u64::from(rate_limit_per_minute.max(1))).max(1);
     let burst = rate_limit_per_minute.max(1);
 
     // Admin routes (issue #409): gated by a dedicated admin auth layer in
@@ -882,64 +874,79 @@ pub fn create_router_with_tx_and_tenant_map(
         let effective_limit = config
             .tenant_rate_limit_per_minute
             .unwrap_or(rate_limit_per_minute);
-        let replenish_ms_t = 60_000u64 / u64::from(effective_limit.max(1));
+        let replenish_ms_t = (60_000u64 / u64::from(effective_limit.max(1))).max(1);
         let burst_t = effective_limit.max(1);
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms_t)
-                .burst_size(burst_t)
-                .key_extractor(ApiKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms_t)
+            .burst_size(burst_t)
+            .key_extractor(ApiKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     } else if behind_proxy {
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms)
-                .burst_size(burst)
-                .key_extractor(SmartIpKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms)
+            .burst_size(burst)
+            .key_extractor(SmartIpKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     } else {
-        let governor_conf = Arc::new(
-            GovernorConfigBuilder::default()
-                .per_millisecond(replenish_ms)
-                .burst_size(burst)
-                .key_extractor(PeerIpKeyExtractor)
-                .use_headers()
-                .finish()
-                .expect("invalid governor config"),
-        );
-        Router::new()
+        let routes = Router::new()
             .route("/status", get(handlers::status))
             .route("/openapi.json", get(handlers::openapi_json))
             .route("/docs", get(handlers::swagger_ui))
             .merge(graphql_routes())
             .nest("/v1", v1)
-            .merge(deprecated)
-            .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
-            .layer(GovernorLayer::new(governor_conf))
+            .merge(deprecated);
+        match GovernorConfigBuilder::default()
+            .per_millisecond(replenish_ms)
+            .burst_size(burst)
+            .key_extractor(PeerIpKeyExtractor)
+            .use_headers()
+            .finish()
+        {
+            Some(conf) => routes
+                .layer(axum::middleware::from_fn(middleware::rate_limit_reject_middleware))
+                .layer(GovernorLayer::new(Arc::new(conf))),
+            // Unreachable with the clamped period/burst above; never panic at startup.
+            None => {
+                tracing::error!("Invalid rate limiter configuration; IP rate limiting disabled");
+                routes
+            }
+        }
     };
 
     // Issue #1112: static dashboard at /ui — outside auth-gated rate limiting.
@@ -1582,12 +1589,10 @@ pub fn create_minimal_router(
 
     let sse_connections_per_ip = std::sync::Arc::new(dashmap::DashMap::new());
 
-    let pool_stats = std::sync::Arc::new(crate::connection_pool::PoolStats::new(
-        config.db_max_connections,
-    ));
-    let adaptive_pool = std::sync::Arc::new(crate::adaptive_pool::AdaptiveTunerState::new(
-        crate::adaptive_pool::AdaptivePoolConfig::default(),
-    ));
+    let crate::db_pool::PoolMonitors {
+        stats: pool_stats,
+        adaptive: adaptive_pool,
+    } = crate::db_pool::monitors();
 
     // Initialize serialization cache with 5-second TTL (Issue #959)
     let serialization_cache = std::sync::Arc::new(

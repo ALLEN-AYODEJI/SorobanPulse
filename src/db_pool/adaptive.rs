@@ -1,4 +1,4 @@
-//! Issue #817: Connection Pool Optimization & Adaptive Tuning
+//! Adaptive pool tuning (Issue #817; moved under `db_pool` by #1244).
 //!
 //! Implements adaptive pool sizing, advanced metrics, connection health checks,
 //! leak detection, and a runtime configuration API for the database connection pool.
@@ -13,13 +13,13 @@
 //! ## Metrics emitted
 //! | Name | Kind | Description |
 //! |------|------|-------------|
-//! | `soroban_pulse_pool_queue_depth` | Gauge | Pending acquisition requests |
-//! | `soroban_pulse_pool_acquire_timeout_total` | Counter | Acquisition timeouts |
-//! | `soroban_pulse_pool_connection_age_seconds` | Histogram | Age of recycled connections |
-//! | `soroban_pulse_pool_health_check_failures_total` | Counter | Failed keepalive pings |
-//! | `soroban_pulse_pool_stale_cleaned_total` | Counter | Stale connections removed |
-//! | `soroban_pulse_pool_adaptive_target_min` | Gauge | Recommended min_connections |
-//! | `soroban_pulse_pool_adaptive_target_max` | Gauge | Recommended max_connections |
+//! | `soroban_pulse_db_pool_acquire_timeout_total` | Counter | Acquisition timeouts |
+//! | `soroban_pulse_db_pool_health_check_failures_total` | Counter | Failed keepalive pings |
+//! | `soroban_pulse_db_pool_stale_connections_total` | Counter | Idle connections flagged stale |
+//! | `soroban_pulse_db_pool_adaptive_target_min` | Gauge | Recommended min_connections |
+//! | `soroban_pulse_db_pool_adaptive_target_max` | Gauge | Recommended max_connections |
+//!
+//! Queue depth is reported by [`super::monitor`] as `soroban_pulse_db_pool_queue_depth`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,11 +135,13 @@ impl AdvancedPoolCounters {
     /// Record an acquisition timeout.
     pub fn record_timeout(&self) {
         self.acquire_timeouts.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::record_pool_acquire_timeout();
     }
 
     /// Record a health-check failure.
     pub fn record_health_failure(&self) {
         self.health_check_failures.fetch_add(1, Ordering::Relaxed);
+        crate::metrics::record_pool_health_check_failure();
     }
 
     /// Record a stale connection cleanup.
@@ -326,6 +328,13 @@ pub struct AdaptiveTunerState {
 }
 
 impl AdaptiveTunerState {
+    /// Tuner state with no background task attached — for routers built
+    /// without [`super::DbPool::init`] (e.g. tests). Config updates are still
+    /// stored and readable; there is simply no tuner consuming them.
+    pub fn detached(config: AdaptivePoolConfig) -> Arc<Self> {
+        Self::new(AdvancedPoolCounters::new(), config).0
+    }
+
     fn new(
         counters: Arc<AdvancedPoolCounters>,
         config: AdaptivePoolConfig,
@@ -355,9 +364,10 @@ impl AdaptiveTunerState {
             }
             history.push_back(current);
         }
-        self.config_tx
-            .send(new_config)
-            .map_err(|_| "config channel closed".to_string())
+        // `send_replace` stores the value even when the tuner task is not
+        // running (detached state), unlike `send`.
+        self.config_tx.send_replace(new_config);
+        Ok(())
     }
 
     /// Roll back to the previous configuration version.
@@ -371,9 +381,7 @@ impl AdaptiveTunerState {
                 .pop_back()
                 .ok_or_else(|| "no previous configuration to roll back to".to_string())?
         };
-        self.config_tx
-            .send(prev.clone())
-            .map_err(|_| "config channel closed".to_string())?;
+        self.config_tx.send_replace(prev.clone());
         Ok(prev)
     }
 
@@ -512,13 +520,14 @@ pub fn spawn_adaptive_monitor(
             // A proxy: if pool has more idle connections than min and they've been
             // idle for longer than the threshold, count them as "potentially stale".
             if idle as u32 > current_min
-                && since_epoch.as_secs() % config.stale_connection_age_secs < interval.as_secs()
+                && since_epoch.as_secs() % config.stale_connection_age_secs.max(1) < interval.as_secs()
             {
                 let stale_estimate = idle as u32 - current_min;
                 if stale_estimate > 0 {
                     counters
                         .stale_cleaned
                         .fetch_add(stale_estimate as u64, Ordering::Relaxed);
+                    crate::metrics::record_pool_stale_connections(u64::from(stale_estimate));
                     debug!(
                         stale_estimate,
                         "Pool stale connection advisory: {} connections may benefit from cleanup",
@@ -542,6 +551,7 @@ pub fn spawn_adaptive_monitor(
                 utilization_std_dev: std_dev,
             };
             state_clone.store_snapshot(snapshot);
+            crate::metrics::update_pool_adaptive_targets(recommended_min, recommended_max);
 
             debug!(
                 utilization = format!("{:.1}%", utilization * 100.0),

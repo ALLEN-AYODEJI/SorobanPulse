@@ -1,3 +1,6 @@
+// Issue #1246: a panic in production is a silent availability incident.
+// Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 pub mod net;
 pub mod email_token;
 pub mod resources;
@@ -45,6 +48,7 @@ pub mod distributed_tracing;
 pub mod email;
 pub mod encryption;
 pub mod error;
+pub mod hmac_util;
 pub mod event_handler;
 pub mod event_hubs;
 pub mod event_replay;
@@ -106,10 +110,8 @@ pub mod query_cache;
 pub mod query_optimizer;
 pub mod query_profiler;
 pub mod push_notification;
-pub mod connection_pool;
+pub mod db_pool;
 pub mod push_preload;
-pub mod pool_management;
-pub mod adaptive_pool;
 pub mod slo_tracker;
 pub mod statistics_management;
 pub mod zero_trust;

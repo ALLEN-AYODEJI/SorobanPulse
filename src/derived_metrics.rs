@@ -374,17 +374,15 @@ pub fn evaluate(
     series: &[DataPoint],
     denominator_series: &[DataPoint],
 ) -> Result<f64, DerivedMetricError> {
-    if series.is_empty() {
+    let (Some(first), Some(last)) = (series.first(), series.last()) else {
         return Err(DerivedMetricError::Evaluation(format!(
             "no data points for metric `{}`",
             metric.name
         )));
-    }
+    };
 
     let value = match &metric.aggregation {
         Aggregation::Rate => {
-            let first = series.first().unwrap();
-            let last = series.last().unwrap();
             let elapsed = (last.timestamp - first.timestamp) as f64;
             if elapsed <= 0.0 {
                 return Err(DerivedMetricError::Evaluation(format!(
@@ -395,8 +393,6 @@ pub fn evaluate(
             (last.value - first.value) / elapsed
         }
         Aggregation::Delta => {
-            let first = series.first().unwrap();
-            let last = series.last().unwrap();
             last.value - first.value
         }
         Aggregation::Ratio => {

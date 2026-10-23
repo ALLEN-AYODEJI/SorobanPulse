@@ -92,8 +92,7 @@ pub fn record_counter_state(counter_name: &str, value: u64) {
 /// SLO-aligned histogram buckets for HTTP request duration (seconds).
 const HTTP_DURATION_BUCKETS: &[f64] = &[0.05, 0.1, 0.2, 0.5, 1.0, 5.0];
 
-/// Initialize the Prometheus metrics exporter
-pub fn init_metrics() -> PrometheusHandle {
+fn prometheus_builder() -> PrometheusBuilder {
     PrometheusBuilder::new()
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(
@@ -101,9 +100,26 @@ pub fn init_metrics() -> PrometheusHandle {
             ),
             HTTP_DURATION_BUCKETS,
         )
-        .expect("Failed to set histogram buckets")
-        .install_recorder()
-        .expect("Failed to install Prometheus exporter")
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Invalid HTTP duration buckets; using exporter defaults");
+            PrometheusBuilder::new()
+        })
+}
+
+/// Initialize the Prometheus metrics exporter.
+///
+/// Installing the global recorder fails if one is already installed (e.g. a
+/// second call within the same test binary). Rather than panicking, return a
+/// handle to a detached recorder so callers still get a working `/metrics`
+/// renderer.
+pub fn init_metrics() -> PrometheusHandle {
+    match prometheus_builder().install_recorder() {
+        Ok(handle) => handle,
+        Err(e) => {
+            tracing::warn!(error = %e, "Prometheus recorder already installed; returning a detached handle");
+            prometheus_builder().build_recorder().handle()
+        }
+    }
 }
 
 /// Record events indexed
@@ -495,6 +511,31 @@ pub fn update_pool_utilization(pool: &PgPool, max_connections: u32) {
     m::gauge!("soroban_pulse_db_pool_utilization").set(utilization);
     m::gauge!("soroban_pulse_db_pool_active_connections").set(active);
     m::gauge!("soroban_pulse_db_pool_max_connections").set(max);
+    // Names documented in README.md ("Database pool metrics").
+    m::gauge!("soroban_pulse_db_pool_size").set(size);
+    m::gauge!("soroban_pulse_db_pool_idle").set(idle);
+    m::gauge!("soroban_pulse_db_pool_max").set(max);
+}
+
+/// Issue #1244: adaptive tuner recommendations (see `db_pool::adaptive`).
+pub fn update_pool_adaptive_targets(recommended_min: u32, recommended_max: u32) {
+    m::gauge!("soroban_pulse_db_pool_adaptive_target_min").set(f64::from(recommended_min));
+    m::gauge!("soroban_pulse_db_pool_adaptive_target_max").set(f64::from(recommended_max));
+}
+
+/// Issue #1244: a failed adaptive-tuner keepalive ping.
+pub fn record_pool_health_check_failure() {
+    m::counter!("soroban_pulse_db_pool_health_check_failures_total").increment(1);
+}
+
+/// Issue #1244: idle connections flagged as potentially stale by the tuner.
+pub fn record_pool_stale_connections(count: u64) {
+    m::counter!("soroban_pulse_db_pool_stale_connections_total").increment(count);
+}
+
+/// Issue #1244: a tracked acquisition that hit its timeout.
+pub fn record_pool_acquire_timeout() {
+    m::counter!("soroban_pulse_db_pool_acquire_timeout_total").increment(1);
 }
 
 /// Issue #622: Record connection acquisition latency.

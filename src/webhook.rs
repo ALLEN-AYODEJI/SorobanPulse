@@ -1,6 +1,5 @@
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 use reqwest::Client;
-use sha2::Sha256;
 use sqlx::Row;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -28,7 +27,6 @@ pub async fn validate_webhook_url(url: &str) -> Result<(), String> {
 use crate::{metrics, models::SorobanEvent, webhook_template::WebhookTemplate};
 use serde_json::Value;
 
-type HmacSha256 = Hmac<Sha256>;
 
 /// Transform webhook payload using a template (Issue #678).
 /// Returns the transformed payload or the original event if template is invalid.
@@ -50,8 +48,7 @@ pub fn transform_webhook_payload(
 
 /// Sign a payload with HMAC-SHA256 and return the hex digest.
 pub fn sign_payload(secret: &str, body: &[u8]) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    let mut mac = crate::hmac_util::hmac_sha256(secret.as_bytes());
     mac.update(body);
     let result = mac.finalize();
     hex::encode(result.into_bytes())

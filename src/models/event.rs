@@ -790,13 +790,10 @@ impl PaginationParams {
 
         // All three must be provided together or none at all
         if has_lat || has_lon || has_radius {
-            if !has_lat || !has_lon || !has_radius {
+            let (Some(lat), Some(lon), Some(radius)) = (self.near_lat, self.near_lon, self.radius_km)
+            else {
                 return Err("near_lat, near_lon, and radius_km must all be provided together".to_string());
-            }
-
-            let lat = self.near_lat.unwrap();
-            let lon = self.near_lon.unwrap();
-            let radius = self.radius_km.unwrap();
+            };
 
             // Validate latitude range
             if lat < -90.0 || lat > 90.0 {
@@ -926,6 +923,41 @@ pub struct SorobanEvent {
 
 fn default_true() -> bool {
     true
+}
+
+/// Lift a live RPC event into the persisted [`Event`] model so notification
+/// channels that format `Event`s (Slack, Discord, Telegram, Teams) can be
+/// driven from the event broadcast pipeline (issue #1245). Fields that only
+/// exist after persistence take neutral defaults.
+impl From<&SorobanEvent> for Event {
+    fn from(e: &SorobanEvent) -> Self {
+        let timestamp = DateTime::parse_from_rfc3339(&e.ledger_closed_at)
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        Self {
+            id: e.id.unwrap_or_else(Uuid::nil),
+            contract_id: e.contract_id.clone(),
+            event_type: e.event_type.parse().unwrap_or(EventType::Contract),
+            tx_hash: e.tx_hash.clone(),
+            ledger: i64::try_from(e.ledger).unwrap_or(i64::MAX),
+            timestamp,
+            event_data: e.value.clone(),
+            event_data_normalized: None,
+            event_data_decoded: None,
+            ledger_hash: e.ledger_hash.clone(),
+            in_successful_call: e.in_successful_call,
+            created_at: timestamp,
+            schema_version: 0,
+            anonymized: false,
+            fingerprint: None,
+            tenant_id: e.tenant_id.clone().unwrap_or_else(|| "default".to_string()),
+            network: "soroban-mainnet".to_string(),
+            tx_index: None,
+            op_index: None,
+            event_index: None,
+            total_count: 0,
+        }
+    }
 }
 
 #[cfg(test)]

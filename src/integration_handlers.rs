@@ -11,7 +11,6 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{
-    config::Config,
     discord::DiscordConfig,
     github::GitHubOAuthConfig,
     integration_secrets::{self, SecretError},
@@ -54,7 +53,12 @@ pub fn validate_callback_url(url: &str) -> Result<(), (StatusCode, String)> {
     })?;
     let host = host.to_ascii_lowercase();
 
-    let allowed = Config::from_env().allowed_callback_domains;
+    let allowed: Vec<String> = std::env::var("ALLOWED_CALLBACK_DOMAINS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+        .collect();
     if allowed.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -901,7 +905,10 @@ pub async fn acknowledge_pagerduty_incident(
 
     let mut config = crate::pagerduty::PagerDutyConfig::default();
     config.routing_key = integration_secrets::open(&routing_key).map_err(secret_error)?;
-    let client = crate::pagerduty::PagerDutyClient::new(config);
+    let client = crate::pagerduty::PagerDutyClient::new(config).map_err(|e| {
+        error!(error = %e, "Failed to build PagerDuty client");
+        (StatusCode::INTERNAL_SERVER_ERROR, "PagerDuty client unavailable".to_string())
+    })?;
 
     client
         .acknowledge_incident(
@@ -956,7 +963,10 @@ pub async fn resolve_pagerduty_incident(
 
     let mut config = crate::pagerduty::PagerDutyConfig::default();
     config.routing_key = integration_secrets::open(&routing_key).map_err(secret_error)?;
-    let client = crate::pagerduty::PagerDutyClient::new(config);
+    let client = crate::pagerduty::PagerDutyClient::new(config).map_err(|e| {
+        error!(error = %e, "Failed to build PagerDuty client");
+        (StatusCode::INTERNAL_SERVER_ERROR, "PagerDuty client unavailable".to_string())
+    })?;
 
     client
         .resolve_incident(&req.dedup_key, Some(&pool))

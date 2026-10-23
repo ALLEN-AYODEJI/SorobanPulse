@@ -1,79 +1,14 @@
-mod audit_logging;
-mod bloom_filter;
-mod compliance_report;
-mod costs;
-mod compression_config;
-mod config;
-mod dashboard;
-mod config_validation;
-mod content_filter;
-mod cross_chain_correlation;
-mod cursor_expiry_handler;
-mod db;
-mod advisory_lock;
-mod query_streaming;
-mod serialization_cache;
-mod streaming_response;
-mod dedup;
-mod distributed_tracing;
-mod email;
-mod encryption;
-mod error;
-mod event_hubs;
-mod graceful_shutdown;
-mod handlers;
-mod idempotency;
-mod log_analysis_tool;
-mod index_monitor;
-mod indexer;
-mod kafka;
-mod kinesis;
-#[cfg(feature = "lua")]
-mod lua_transform;
-mod metrics;
-mod prometheus_remote_write;
-mod eventbridge;
-mod middleware;
-mod models;
-mod normalizer;
-mod notification_dedup;
+// Issue #1246: a panic in production is a silent availability incident.
+// Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, config_validation, content_filter, cross_chain_correlation, costs, cursor_expiry_handler, db, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, adaptive_pool, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, connection_pool, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, pool_management, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
+use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, content_filter, costs, cross_chain_correlation, cursor_expiry_handler, db, db_pool, derived_metrics, incident_correlation, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
 #[cfg(feature = "lua")]
 use soroban_pulse::lua_transform;
 #[cfg(feature = "parquet")]
 use soroban_pulse::parquet_export;
 #[cfg(feature = "graphql")]
 use soroban_pulse::graphql;
-#[cfg(feature = "graphql")]
-mod graphql_subscriptions;
-mod event_dedup_replicas;
-mod bulk_export;
-mod sse_ring_buffer;
-mod query_cache;
-mod query_plan_cache;
-mod query_optimizer;
-mod partition_manager;
-mod query_builder;
-mod adaptive_pool;
-mod pool_management;
-mod statistics_management;
-mod notification_admin;
-mod push_preload;
-mod financial_accuracy;
-mod webhook_template;
-mod event_aggregation;
-mod anomaly_detection;
-mod derived_metrics;
-mod incident_correlation;
-mod push_notification;
-mod connection_pool;
-mod slo_tracker;
-mod anonymization;
-mod event_compression;
-mod health_check;
-mod ledger_hashes;
-mod networks;
 
 #[cfg(feature = "graphql")]
 use soroban_pulse::graphql_subscriptions;
@@ -92,6 +27,8 @@ use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 #[cfg(feature = "otel")]
 use tracing_opentelemetry::OpenTelemetryLayer;
+
+use anyhow::Context;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -115,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
                     .with_endpoint(otel_endpoint),
             )
             .install_simple()
-            .expect("Failed to initialize OpenTelemetry tracer");
+            .context("Failed to initialize OpenTelemetry tracer")?;
 
         registry.with(OpenTelemetryLayer::new(tracer))
     };
@@ -138,20 +75,12 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     jobs.adopt("memory-collector", metrics::spawn_memory_collector());
 
-    let config = config::Config::from_env();
-
-    // Issue #997: Validate the fully-loaded configuration before doing anything else.
-    {
-        let report = config_validation::validate(&config);
-        report.log();
-        if !report.is_ok() {
-            eprintln!(
-                "Configuration validation failed with {} error(s) — aborting startup.",
-                report.errors.len()
-            );
-            std::process::exit(1);
-        }
-    }
+    // Issue #1247: parse + validate the configuration exactly once. Every
+    // parse and semantic error is reported together in `ConfigError`.
+    let config = config::ConfigBuilder::from_env().build().inspect_err(|e| {
+        error!("{e}");
+        eprintln!("Startup aborted due to configuration errors. Fix the above and restart.");
+    })?;
 
     info!(
         rpc_url = %config.stellar_rpc_url,
@@ -166,31 +95,14 @@ async fn main() -> anyhow::Result<()> {
         "Resolved configuration",
     );
 
-    let pool = {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match db::create_pool(
-                &config.database_url,
-                config.db_max_connections,
-                config.db_min_connections,
-                config.db_statement_timeout_ms,
-                config.db_idle_timeout_secs,
-                config.db_max_lifetime_secs,
-                config.db_test_before_acquire,
-            )
-            .await
-            {
-                Ok(p) => break p,
-                Err(e) => {
-                    if attempt >= 3 {
-                        tracing::error!(error = %e, "Failed to connect to database after 3 attempts");
-                        return Err(anyhow::anyhow!("Database connection failed after 3 attempts"));
-                    }
-                    tracing::warn!(attempt = attempt, "DB connection failed, retrying...");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                }
-            }
+    // Issue #1244: the single pool initialisation path — connects with
+    // retries and starts the pool monitor + adaptive tuner exactly once.
+    let pool_settings = db_pool::DbPoolSettings::from_config(&config);
+    let pool = match db_pool::DbPool::init(&config.database_url, &pool_settings, 3, Duration::from_secs(2)).await {
+        Ok(db) => db.into_pool(),
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to connect to database after 3 attempts");
+            return Err(anyhow::anyhow!("Database connection failed after 3 attempts"));
         }
     };
 
@@ -268,17 +180,7 @@ async fn main() -> anyhow::Result<()> {
     // Create read pool: use replica URL if configured, otherwise reuse primary pool.
     let read_pool = if let Some(ref replica_url) = config.database_replica_url {
         info!("DATABASE_REPLICA_URL set — HTTP handlers will use read replica");
-        match db::create_pool(
-            replica_url,
-            config.db_max_connections,
-            config.db_min_connections,
-            config.db_statement_timeout_ms,
-            config.db_idle_timeout_secs,
-            config.db_max_lifetime_secs,
-            config.db_test_before_acquire,
-        )
-        .await
-        {
+        match db_pool::connect(replica_url, &pool_settings).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to connect to read replica, falling back to primary");
@@ -372,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("Failed to build webhook HTTP client");
+            .context("Failed to build webhook HTTP client")?;
 
         info!(
             url = %webhook_url,
@@ -505,14 +407,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Spawn SMS notification task if Twilio is configured (Issue #473)
+    // Issue #1245: environment-configured notification channels are
+    // registered with a single dispatcher that consumes the event stream.
+    // New channels only need a `NotificationChannel` impl and a `register`.
+    let mut notification_dispatcher = notification_channel::NotificationDispatcher::new();
+
+    // SMS notifications if Twilio is configured (Issue #473)
     if let (Some(account_sid), Some(auth_token), Some(from_number)) = (
         &config.twilio_account_sid,
         &config.twilio_auth_token,
         &config.twilio_from_number,
     ) {
         if !config.sms_to_numbers.is_empty() {
-            let sms_rx = event_tx.subscribe();
             let twilio_config = sms::TwilioConfig {
                 account_sid: account_sid.clone(),
                 auth_token: auth_token.clone(),
@@ -520,23 +426,30 @@ async fn main() -> anyhow::Result<()> {
                 to_numbers: config.sms_to_numbers.clone(),
             };
 
-            let notifier = sms::SmsNotifier::new(
+            match sms::SmsNotifier::new(
                 twilio_config,
                 config.sms_contract_filter.clone(),
                 config.sms_retry_policy.clone(),
                 pool.clone(),
-            );
-
-            info!(
-                from_number = %from_number,
-                recipients = config.sms_to_numbers.len(),
-                "SMS notifications enabled"
-            );
-
-            jobs.adopt("sms-notifier", notifier.spawn(sms_rx));
+            ) {
+                Ok(notifier) => {
+                    info!(
+                        from_number = %from_number,
+                        recipients = config.sms_to_numbers.len(),
+                        "SMS notifications enabled"
+                    );
+                    notification_dispatcher.register(std::sync::Arc::new(notifier));
+                }
+                Err(e) => error!(error = %e, "SMS notifications disabled"),
+            }
         } else {
             warn!("Twilio credentials set but SMS_TO_NUMBERS is empty — SMS notifications disabled");
         }
+    }
+
+    if !notification_dispatcher.is_empty() {
+        info!(channels = ?notification_dispatcher.channel_names(), "Notification dispatcher started");
+        notification_dispatcher.spawn(event_tx.subscribe());
     }
 
     // Issue #619: Spawn subscription email delivery worker.
@@ -574,18 +487,8 @@ async fn main() -> anyhow::Result<()> {
         jobs.spawn("push-delivery", push_notification::run_push_delivery_worker(push_pool));
     }
 
-    // Issue #622: Spawn connection pool monitor.
-    {
-        let pool_cfg = connection_pool::PoolMonitorConfig {
-            max_connections: config.db_max_connections,
-            min_connections: config.db_min_connections,
-            exhaustion_threshold: 0.9,
-            sample_interval: std::time::Duration::from_secs(15),
-        };
-        let (_, handle) = connection_pool::spawn_pool_monitor_with_handle(pool.clone(), pool_cfg);
-        jobs.adopt("pool-monitor", handle);
-        connection_pool::log_pool_snapshot(&pool, config.db_max_connections);
-    }
+    // Issue #622 / #1244: the pool monitor and adaptive tuner were started by
+    // `db_pool::DbPool::init` above.
 
     // Spawn Redis publisher if configured
     if let (Some(redis_url), Some(redis_stream_key)) = (&config.redis_url, &config.redis_stream_key)
@@ -618,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
     let sse_ring_buf = sse_ring_buffer::SseRingBuffer::new(config.sse_ring_buffer_capacity);
 
     // Build and wire up the indexer only when this instance is configured to run it.
-    let rpc_client = indexer::SorobanRpcClient::new(&config);
+    let rpc_client = indexer::SorobanRpcClient::new(&config)?;
     // Issue #1256: measures endpoint latency for routing; spawned with the indexer.
     let rpc_latency_probe = rpc_client.latency_probe();
     let mut indexer = indexer::Indexer::new(
@@ -643,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
             (config.bloom_filter_capacity, config.bloom_filter_fp_rate)
         };
 
-        let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(capacity, fp_rate));
+        let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(capacity, fp_rate)?);
         match bloom_filter::seed_from_db(&bloom, &pool, 100_000).await {
             Ok(n) => info!(seeded = n, capacity = capacity, fp_rate = fp_rate, "Bloom filter seeded from DB"),
             Err(e) => tracing::warn!(error = %e, "Failed to seed bloom filter from DB"),
@@ -755,6 +658,7 @@ async fn main() -> anyhow::Result<()> {
         jobs.spawn("indexer", async move {
             indexer.run().await;
         });
+        tokio::spawn(rpc_latency_probe.run(shutdown_rx.clone()));
         indexer_job_names.push("indexer".to_string());
 
         // Issue #1063: index additional networks (e.g. testnet alongside
@@ -778,7 +682,13 @@ async fn main() -> anyhow::Result<()> {
             // never route this network's requests to them.
             network_config.stellar_rpc_fallback_urls = Vec::new();
 
-            let network_rpc_client = indexer::SorobanRpcClient::new(&network_config);
+            let network_rpc_client = match indexer::SorobanRpcClient::new(&network_config) {
+                Ok(client) => client,
+                Err(e) => {
+                    error!(chain_id = %target.chain_id, error = %e, "Skipping additional network indexer");
+                    continue;
+                }
+            };
             tokio::spawn(network_rpc_client.latency_probe().run(shutdown_rx.clone()));
             let mut network_indexer = indexer::Indexer::new(
                 pool.clone(),
@@ -880,7 +790,7 @@ async fn main() -> anyhow::Result<()> {
         let health_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .expect("Failed to build health check HTTP client");
+            .context("Failed to build health check HTTP client")?;
         let interval_secs = config.notification_health_check_interval_secs;
         let health_check_email = config.notification_health_check_email.clone();
         jobs.adopt(
@@ -928,11 +838,18 @@ async fn main() -> anyhow::Result<()> {
     ) {
         #[cfg(unix)]
         {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {},
-                _ = sigterm.recv() => {},
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {},
+                        _ = sigterm.recv() => {},
+                    }
+                }
+                Err(e) => {
+                    // Without a SIGTERM handler we can still shut down on Ctrl-C.
+                    tracing::warn!(error = %e, "Failed to install SIGTERM handler; listening for Ctrl-C only");
+                    tokio::signal::ctrl_c().await.ok();
+                }
             }
         }
 

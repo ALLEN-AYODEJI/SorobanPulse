@@ -124,13 +124,13 @@ impl CostCalculator {
 
     /// Replace the default database pricing rates.
     pub fn with_db_rates(self, rates: DatabaseRates) -> Self {
-        self.inner.write().unwrap().db_rates = rates;
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).db_rates = rates;
         self
     }
 
     /// Replace the default compute pricing rates.
     pub fn with_compute_rates(self, rates: ComputeRates) -> Self {
-        self.inner.write().unwrap().compute_rates = rates;
+        self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner).compute_rates = rates;
         self
     }
 
@@ -147,7 +147,7 @@ impl CostCalculator {
         hours: f64,
     ) {
         let entry = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             let db_cost = database::calculate(usage, &inner.db_rates, hours);
             database::to_cost_entry(&db_cost, "primary-database")
         };
@@ -167,7 +167,7 @@ impl CostCalculator {
         hours: f64,
     ) {
         let entry = {
-            let inner = self.inner.read().unwrap();
+            let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
             let compute_cost = compute::calculate(usage, &inner.compute_rates, hours);
             compute::to_cost_entry(&compute_cost, "application-server")
         };
@@ -236,40 +236,40 @@ impl CostCalculator {
     }
 
     fn push_entry(&self, component: CostComponent, entry: CostEntry) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.entries.push(entry);
         inner.entry_components.push(component);
     }
 
     /// Update the running event and request counters (used for efficiency metrics).
     pub fn update_counters(&self, events: u64, requests: u64) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner.event_count += events;
         inner.request_count += requests;
     }
 
     /// Compute a cost breakdown aggregated across all recorded entries.
     pub fn breakdown(&self) -> CostBreakdown {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         build_breakdown(&inner.entries)
     }
 
     /// Compute per-component cost totals across all recorded entries.
     pub fn component_costs(&self) -> ComponentCosts {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         build_component_costs(&inner.entries, &inner.entry_components)
     }
 
     /// Snapshot of all recorded entries (cloned), used by the report and
     /// forecast code paths.
     pub fn entries(&self) -> Vec<CostEntry> {
-        self.inner.read().unwrap().entries.clone()
+        self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner).entries.clone()
     }
 
     /// Snapshot of all recorded entries paired with the component that
     /// incurred them.
     pub fn entries_with_components(&self) -> Vec<(CostComponent, CostEntry)> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         inner
             .entries
             .iter()
@@ -281,7 +281,7 @@ impl CostCalculator {
 
     /// Generate a cost report over the entries recorded since the given start time.
     pub fn report(&self, period_start: chrono::DateTime<Utc>) -> CostReport {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut period_entries: Vec<CostEntry> = Vec::new();
         let mut period_components: Vec<CostComponent> = Vec::new();
         for (entry, component) in inner.entries.iter().zip(inner.entry_components.iter()) {
@@ -322,7 +322,7 @@ impl CostCalculator {
 
     /// Compute efficiency metrics (cost-per-event, cost-per-request, etc.).
     pub fn metrics(&self) -> CostMetrics {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         let breakdown = build_breakdown(&inner.entries);
         let total = breakdown.total;
 
@@ -353,32 +353,24 @@ impl CostCalculator {
     /// Remove all entries older than `retain_hours` hours.
     pub fn prune_older_than(&self, retain_hours: i64) {
         let cutoff = Utc::now() - chrono::Duration::hours(retain_hours);
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Inner {
             entries,
             entry_components,
             ..
         } = &mut *inner;
-        let mut idx = 0;
-        entries.retain(|e| {
-            let keep = e.timestamp >= cutoff;
-            idx += 1;
-            keep
-        });
-        // Rebuild the parallel component vector using the same predicate.
-        let mut kept_components = Vec::with_capacity(entries.len());
-        let mut kept_entries = Vec::with_capacity(entries.len());
-        for (entry, component) in entries.drain(..).zip(entry_components.drain(..)) {
-            kept_entries.push(entry);
-            kept_components.push(component);
-        }
+        let (kept_entries, kept_components): (Vec<_>, Vec<_>) = entries
+            .drain(..)
+            .zip(entry_components.drain(..))
+            .filter(|(e, _)| e.timestamp >= cutoff)
+            .unzip();
         *entries = kept_entries;
         *entry_components = kept_components;
     }
 
     /// Total number of recorded cost entries.
     pub fn entry_count(&self) -> usize {
-        self.inner.read().unwrap().entries.len()
+        self.inner.read().unwrap_or_else(std::sync::PoisonError::into_inner).entries.len()
     }
 }
 
@@ -433,10 +425,9 @@ fn build_component_costs(
 }
 
 fn hourly_rate_from_entries(entries: &[CostEntry]) -> f64 {
-    if entries.is_empty() {
+    let Some(oldest) = entries.iter().map(|e| e.timestamp).min() else {
         return 0.0;
-    }
-    let oldest = entries.iter().map(|e| e.timestamp).min().unwrap();
+    };
     let hours = (Utc::now() - oldest).num_minutes() as f64 / 60.0;
     if hours < 0.001 {
         return 0.0;

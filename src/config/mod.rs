@@ -6,6 +6,8 @@ use url::Url;
 use secrecy::SecretString;
 
 pub mod reference;
+mod builder;
+pub use builder::{ConfigBuilder, ConfigError, DatabaseSettings, Missing, RpcSettings, ServerSettings, Set};
 
 /// Load an optional TOML config file. Returns an empty table if the file is
 /// absent or CONFIG_FILE is not set — never an error.
@@ -199,7 +201,7 @@ impl HealthState {
     pub fn update_last_poll(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         self.last_indexer_poll.store(now, Ordering::SeqCst);
     }
@@ -215,7 +217,7 @@ impl HealthState {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let elapsed = now.saturating_sub(last_poll);
@@ -651,6 +653,31 @@ pub struct Config {
     /// @description Comma-separated contract IDs to send email notifications for. Empty = notify for all contracts.
     pub email_contract_filter: Vec<String>,
 
+    /// @env EMAIL_SCHEDULE
+    /// @default immediate
+    /// @description Notification scheduling mode: "immediate", "daily" or "cron" (Issue #479).
+    pub email_schedule: String,
+
+    /// @env EMAIL_DAILY_DIGEST_HOUR
+    /// @default 9
+    /// @description Hour of day (0-23, UTC) at which the daily digest is sent.
+    pub email_daily_digest_hour: u32,
+
+    /// @env EMAIL_CRON
+    /// @default (none)
+    /// @description Cron expression used when EMAIL_SCHEDULE is "cron".
+    pub email_cron: Option<String>,
+
+    /// @env EMAIL_QUIET_HOURS_START
+    /// @default (none)
+    /// @description Start of the quiet-hours window ("HH:MM", UTC).
+    pub email_quiet_hours_start: Option<String>,
+
+    /// @env EMAIL_QUIET_HOURS_END
+    /// @default (none)
+    /// @description End of the quiet-hours window ("HH:MM", UTC).
+    pub email_quiet_hours_end: Option<String>,
+
     /// @env EMAIL_PUBLIC_BASE_URL
     /// @default http://localhost:<PORT>
     /// @description Public base URL used to build unsubscribe links in notification emails (e.g. https://pulse.example.com).
@@ -1059,6 +1086,7 @@ impl Default for Config {
             sse_keepalive_interval_ms: 15000,
             sse_max_connections: 1000,
             sse_drain_timeout_secs: 5,
+            sse_multi_max_contract_ids: 100,
             environment: Environment::Development,
             max_body_size_bytes: 1024 * 1024, // 1 MB default
             log_sample_rate: 1,
@@ -1210,14 +1238,14 @@ impl Default for Config {
     }
 }
 
-fn validate_rpc_url_checked(raw: &str, errors: &mut Vec<String>) -> Option<String> {
+pub(crate) fn validate_rpc_url_checked(raw: &str, errors: &mut Vec<String>) -> Option<String> {
     validate_rpc_url_named("STELLAR_RPC_URL", raw, errors)
 }
 
 /// Validate a single RPC URL, attributing any errors to `var` (e.g.
 /// "STELLAR_RPC_URL" or "STELLAR_RPC_FALLBACK_URLS"). On success returns the
 /// URL with any embedded credentials stripped.
-fn validate_rpc_url_named(var: &str, raw: &str, errors: &mut Vec<String>) -> Option<String> {
+pub(crate) fn validate_rpc_url_named(var: &str, raw: &str, errors: &mut Vec<String>) -> Option<String> {
     let url = match Url::parse(raw) {
         Ok(u) => u,
         Err(e) => {
@@ -1293,16 +1321,54 @@ fn validate_rpc_url_named(var: &str, raw: &str, errors: &mut Vec<String>) -> Opt
 /// Parse and validate STELLAR_RPC_FALLBACK_URLS: a comma-separated list of
 /// fallback RPC endpoints used when the primary URL fails. Each entry is
 /// validated with the same rules as STELLAR_RPC_URL.
+#[cfg(test)]
 fn parse_rpc_fallback_urls_checked(errors: &mut Vec<String>) -> Vec<String> {
-    let raw = match env::var("STELLAR_RPC_FALLBACK_URLS") {
-        Ok(v) if !v.trim().is_empty() => v,
-        _ => return Vec::new(),
-    };
-    raw.split(',')
-        .map(|s| s.trim())
+    validate_rpc_fallback_urls(&read_rpc_fallback_urls(), errors)
+}
+
+/// Split STELLAR_RPC_FALLBACK_URLS into its (unvalidated) entries.
+fn read_rpc_fallback_urls() -> Vec<String> {
+    env::var("STELLAR_RPC_FALLBACK_URLS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Validate each fallback URL, dropping (and reporting) invalid entries.
+fn validate_rpc_fallback_urls(urls: &[String], errors: &mut Vec<String>) -> Vec<String> {
+    urls.iter()
         .filter_map(|u| validate_rpc_url_named("STELLAR_RPC_FALLBACK_URLS", u, errors))
         .collect()
+}
+
+/// Resolve the RPC endpoint list (issue #1256) without validating it.
+///
+/// `STELLAR_RPC_URLS` (comma-separated) takes precedence over
+/// `STELLAR_RPC_URL`; its first entry becomes the primary and the rest are
+/// failover candidates. `STELLAR_RPC_FALLBACK_URLS` entries are appended in
+/// either case. Returns `(primary, others)` with duplicates removed.
+/// Validation happens in [`ConfigBuilder::build`].
+fn resolve_rpc_urls(
+    urls_raw: Option<&str>,
+    single_raw: &str,
+    fallbacks: Vec<String>,
+) -> (String, Vec<String>) {
+    let mut candidates = urls_raw
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let primary = candidates.next().unwrap_or_else(|| single_raw.to_string());
+    let mut others: Vec<String> = Vec::new();
+    for url in candidates.chain(fallbacks) {
+        if url != primary && !others.contains(&url) {
+            others.push(url);
+        }
+    }
+    (primary, others)
 }
 
 /// Resolve the RPC endpoint list (issue #1256).
@@ -1311,6 +1377,7 @@ fn parse_rpc_fallback_urls_checked(errors: &mut Vec<String>) -> Vec<String> {
 /// `STELLAR_RPC_URL`; its first entry becomes the primary and the rest are
 /// failover candidates. `STELLAR_RPC_FALLBACK_URLS` entries are appended in
 /// either case. Returns `(primary, others)` with duplicates removed.
+#[cfg(test)]
 fn resolve_rpc_urls_checked(
     urls_raw: Option<&str>,
     single_raw: &str,
@@ -1352,18 +1419,9 @@ fn resolve_database_url_checked(errors: &mut Vec<String>) -> String {
             }
         }
     }
-    match env::var("DATABASE_URL") {
-        Ok(v) if !v.is_empty() => v,
-        _ => {
-            errors.push(
-                "  DATABASE_URL is not set. \
-                 Expected a PostgreSQL connection string \
-                 (e.g., postgres://user:pass@localhost/soroban_pulse)."
-                    .to_string(),
-            );
-            String::new()
-        }
-    }
+    // A missing DATABASE_URL is reported by `ConfigBuilder::build` (via
+    // `config_validation::check_database`), not here.
+    env::var("DATABASE_URL").unwrap_or_default()
 }
 
 /// Parse STELLAR_RPC_HEADERS: semicolon-separated "Name: Value" pairs.
@@ -1610,7 +1668,10 @@ impl Config {
             .collect()
     }
 
-    pub fn from_env() -> Self {
+    /// Read every setting from the environment / `CONFIG_FILE`, collecting
+    /// parse errors instead of aborting. Cross-field and semantic validation
+    /// happens once, in [`ConfigBuilder::build`] (issue #1247).
+    fn read_env() -> (Self, Vec<String>) {
         let file = load_config_file();
         let mut errors: Vec<String> = Vec::new();
 
@@ -1647,34 +1708,18 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
-        if environment.is_production_like() && allowed_origins.iter().any(|o| o == "*") {
-            errors.push(format!(
-                "  ALLOWED_ORIGINS=* is not permitted in {environment:?}. \
-                 Set explicit origins (e.g., https://app.example.com) or use ENVIRONMENT=development."
-            ));
-        }
-
-        // Issue #938: fail fast on malformed origins instead of letting
-        // build_cors() silently drop them from the CORS layer.
-        for msg in crate::middleware::validate_cors_origins(&allowed_origins) {
-            errors.push(format!("  {msg}"));
-        }
-
         let database_url = resolve_database_url_checked(&mut errors);
 
-        let (stellar_rpc_url, stellar_rpc_fallback_urls) = {
-            let fallbacks = parse_rpc_fallback_urls_checked(&mut errors);
-            resolve_rpc_urls_checked(
-                env_or_file("STELLAR_RPC_URLS", &file).as_deref(),
-                &env_or_file_or(
-                    "STELLAR_RPC_URL",
-                    &file,
-                    "https://soroban-testnet.stellar.org",
-                ),
-                fallbacks,
-                &mut errors,
-            )
-        };
+        // Validated (and credentials stripped) in `ConfigBuilder::build`.
+        let (stellar_rpc_url, stellar_rpc_fallback_urls) = resolve_rpc_urls(
+            env_or_file("STELLAR_RPC_URLS", &file).as_deref(),
+            &env_or_file_or(
+                "STELLAR_RPC_URL",
+                &file,
+                "https://soroban-testnet.stellar.org",
+            ),
+            read_rpc_fallback_urls(),
+        );
 
         let db_max_connections = parse_int::<u32>(
             "DB_MAX_CONNECTIONS",
@@ -1881,7 +1926,7 @@ impl Config {
             "100",
             &mut errors,
         )
-        .unwrap_or(5);
+        .unwrap_or(100);
 
         let max_body_size_bytes = parse_int::<usize>(
             "MAX_BODY_SIZE_BYTES",
@@ -2070,19 +2115,7 @@ impl Config {
             "incident correlation configuration resolved"
         );
 
-        // Report all errors at once, then exit with code 1 so operators get a
-        // clear, deterministic startup failure (a panic would exit with 101).
-        if !errors.is_empty() {
-            eprintln!(
-                "Configuration errors ({} found):\n{}",
-                errors.len(),
-                errors.join("\n")
-            );
-            eprintln!("Startup aborted due to configuration errors. Fix the above and restart.");
-            std::process::exit(1);
-        }
-
-        Self {
+        let config = Self {
             database_url,
             database_replica_url: env::var("DATABASE_REPLICA_URL")
                 .ok()
@@ -2139,7 +2172,7 @@ impl Config {
             sse_max_connections,
             sse_drain_timeout_secs,
             sse_multi_max_contract_ids,
-            environment,
+            environment: environment.clone(),
             max_body_size_bytes,
             log_sample_rate,
             webhook_url: env::var("WEBHOOK_URL").ok().filter(|s| !s.is_empty()),
@@ -2519,7 +2552,8 @@ impl Config {
             derived_metrics_interval_secs,
             correlation_window_secs,
             incident_detector_interval_secs,
-        }
+        };
+        (config, errors)
     }
 }
 
@@ -2594,9 +2628,10 @@ mod tests {
         assert_eq!(health_state.is_indexer_stalled(), Some(0));
         health_state.update_last_poll();
         assert_eq!(health_state.is_indexer_stalled(), None);
+        // Polls are tracked at whole-second granularity, so backdate the last
+        // poll instead of sleeping (a 10 ms sleep never crossed the threshold).
         let health_state_short = HealthState::new(0);
-        health_state_short.update_last_poll();
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        health_state_short.last_indexer_poll.store(1, Ordering::SeqCst);
         assert!(health_state_short.is_indexer_stalled().is_some());
     }
 
@@ -3046,9 +3081,16 @@ mod tests {
         let mut errors = Vec::new();
         let url = resolve_database_url_checked(&mut errors);
         assert!(url.is_empty());
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("DATABASE_URL"));
-        assert!(errors[0].contains("postgres://"));
+        // Issue #1247: reported once, by `ConfigBuilder::build`.
+        assert!(errors.is_empty());
+        let err = ConfigBuilder::new()
+            .with_database(DatabaseSettings::new(url))
+            .with_rpc(RpcSettings::new("https://soroban-testnet.stellar.org"))
+            .build()
+            .unwrap_err();
+        let db_errors: Vec<_> = err.errors().iter().filter(|e| e.contains("DATABASE_URL")).collect();
+        assert_eq!(db_errors.len(), 1, "{err}");
+        assert!(db_errors[0].contains("postgres://"));
     }
 
     // --- config file helpers ---
