@@ -341,7 +341,7 @@ pub async fn is_feature_enabled_with_metrics(
     Ok(result)
 }
 
-pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<bool>) {
+pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<bool>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let watcher = FeatureFlagWatcher::new(pool);
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -357,7 +357,7 @@ pub fn spawn(pool: PgPool, interval_secs: u64, mut shutdown_rx: watch::Receiver<
                 }
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]

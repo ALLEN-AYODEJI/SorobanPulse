@@ -2,7 +2,7 @@
 // Test code is exempt via `allow-{unwrap,expect}-in-tests` in .clippy.toml.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
-use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, content_filter, cross_chain_correlation, cursor_expiry_handler, db, db_pool, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
+use soroban_pulse::{audit_logging, bloom_filter, compliance_report, compression_config, config, content_filter, costs, cross_chain_correlation, cursor_expiry_handler, db, db_pool, derived_metrics, incident_correlation, advisory_lock, query_streaming, serialization_cache, streaming_response, dedup, distributed_tracing, email, encryption, error, event_hubs, graceful_shutdown, handlers, idempotency, log_analysis_tool, index_monitor, indexer, kafka, kinesis, metrics, prometheus_remote_write, eventbridge, middleware, models, normalizer, notification_dedup, warehouse, pruner, pubsub, queue_publisher, rate_limiter, reencrypt, resource_metrics, routes, rpc_client, schema_validator, sqs, stats_refresh, subscriptions, webhook, webhook_verification, notification_rate_limit, notification_formatter, pagerduty, github, discord, slack, teams, telegram, notification_channel, notification_delivery, integration_handlers, retry_policy, sms, aggregation, saved_queries, abi, oncall, xdr_validation, replica_monitor, feature_flags, event_dedup_replicas, bulk_export, sse_ring_buffer, query_cache, query_plan_cache, query_optimizer, partition_manager, query_builder, notification_admin, financial_accuracy, webhook_template, event_aggregation, anomaly_detection, push_notification, slo_tracker, anonymization, event_compression, health_check, ledger_hashes, networks, zero_trust, push_preload, statistics_management, cloud_provider, cloud_replication, deployment_orchestrator};
 #[cfg(feature = "lua")]
 use soroban_pulse::lua_transform;
 #[cfg(feature = "parquet")]
@@ -68,8 +68,12 @@ async fn main() -> anyhow::Result<()> {
     // Initialize metrics exporter
     let prometheus_handle = metrics::init_metrics();
 
+    // Issue #1248: every background task is registered with the scheduler so
+    // it is listed by `GET /v1/admin/jobs` and aborted on shutdown.
+    let jobs = soroban_pulse::job_scheduler::global().clone();
+
     #[cfg(target_os = "linux")]
-    metrics::spawn_memory_collector();
+    jobs.adopt("memory-collector", metrics::spawn_memory_collector());
 
     // Issue #1247: parse + validate the configuration exactly once. Every
     // parse and semantic error is reported together in `ConfigError`.
@@ -136,6 +140,43 @@ async fn main() -> anyhow::Result<()> {
         info!("RUN_MIGRATIONS_ON_STARTUP=false — skipping startup migrations (expected to be run by the Helm migration Job)");
     }
 
+    // Issue #1252: `--backfill-from <ledger> --backfill-to <ledger>` replays
+    // historical ledgers from the Galexie data lake through the indexer's
+    // insert path, then exits. Safe to run alongside a live indexer.
+    match soroban_pulse::backfill::parse_cli_range(std::env::args().skip(1)) {
+        Ok(None) => {}
+        Ok(Some((from, to))) => {
+            let cfg = match soroban_pulse::backfill::BackfillConfig::from_env(from, to, &config.chain_id) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    error!(error = %e, "invalid backfill configuration");
+                    std::process::exit(2);
+                }
+            };
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let sink = std::sync::Arc::new(soroban_pulse::indexer::Indexer::new(
+                pool.clone(),
+                config.clone(),
+                shutdown_rx,
+                soroban_pulse::indexer::SorobanRpcClient::new(&config),
+            ));
+            match soroban_pulse::backfill::run(pool.clone(), sink, cfg).await {
+                Ok(summary) => {
+                    info!(ledgers = summary.ledgers, events_inserted = summary.events_inserted, "Backfill complete — exiting");
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    error!(error = %e, "Backfill failed — re-run the same command to resume");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Err(e) => {
+            error!(error = %e, "invalid backfill arguments");
+            std::process::exit(2);
+        }
+    }
+
     // Create read pool: use replica URL if configured, otherwise reuse primary pool.
     let read_pool = if let Some(ref replica_url) = config.database_replica_url {
         info!("DATABASE_REPLICA_URL set — HTTP handlers will use read replica");
@@ -183,6 +224,37 @@ async fn main() -> anyhow::Result<()> {
     // Broadcast channel for real-time SSE streaming (capacity 256 events)
     let (event_tx, _) = tokio::sync::broadcast::channel::<models::SorobanEvent>(256);
 
+    // Issue #1264: Shared operational cost calculator. Wired into the indexer
+    // (RPC + DB costs), webhook delivery and email paths so that every
+    // component records its spend into a single in-memory store. Hourly
+    // snapshots are persisted by the collector spawned further below.
+    let cost_calculator = Arc::new(costs::calculator::CostCalculator::new(
+        costs::calculator::CostRates::from_env(),
+    ));
+
+    // Issue #1266: In-memory idempotency key store with a 24-hour TTL. A
+    // periodic sweeper removes expired entries so the map does not grow
+    // unbounded on long-running pods.
+    let idempotency_store = idempotency::shared_store();
+    {
+        let store = idempotency_store.clone();
+        let mut idem_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let removed = store.remove_expired();
+                        if removed > 0 {
+                            tracing::debug!(removed = removed, "Pruned expired idempotency keys");
+                        }
+                    }
+                    _ = idem_shutdown_rx.changed() => break,
+                }
+            }
+        });
+    }
+
     // Spawn webhook delivery task if WEBHOOK_URL is configured.
     if let Some(ref webhook_url) = config.webhook_url {
         let webhook_rx = event_tx.subscribe();
@@ -191,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         let webhook_contract_filter = config.webhook_contract_filter.clone();
         let webhook_retry_policy = config.webhook_retry_policy.clone();
         let webhook_pool = pool.clone();
+        let webhook_cost_calculator = cost_calculator.clone();
         // Per-channel rate limiter (Issue #476). `None` when no limit configured.
         let webhook_rate_limiter = notification_rate_limit::ChannelRateLimiter::from_config(
             &notification_rate_limit::RateLimitConfig::new(
@@ -210,7 +283,7 @@ async fn main() -> anyhow::Result<()> {
             "Webhook delivery enabled"
         );
 
-        tokio::spawn(async move {
+        jobs.spawn("webhook-delivery", async move {
             let mut rx = webhook_rx;
             loop {
                 match rx.recv().await {
@@ -231,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
                         let url = webhook_url.clone();
                         let secret = webhook_secret.clone();
                         let pool_ref = Some(pool.as_ref());
+                        let cost_calc = webhook_cost_calculator.clone();
                         let priority = webhook::evaluate_priority(
                             &event,
                             config.notification_priority_rule_path.as_deref(),
@@ -238,15 +312,26 @@ async fn main() -> anyhow::Result<()> {
                             config.notification_priority_rule_priority.as_deref(),
                             &config.notification_default_priority,
                         ).to_string();
-                        tokio::spawn(webhook::deliver_with_retry_policy(
-                            client,
-                            url,
-                            secret,
-                            event,
-                            pool_ref,
-                            &config.webhook_retry_policy,
-                            priority,
-                        ));
+                        tokio::spawn(async move {
+                            let started = std::time::Instant::now();
+                            webhook::deliver_with_retry_policy(
+                                client,
+                                url,
+                                secret,
+                                event,
+                                pool_ref,
+                                &config.webhook_retry_policy,
+                                priority,
+                            )
+                            .await;
+                            // Issue #1264: record the delivery cost (one unit per
+                            // webhook HTTP call, priced by the configured rate).
+                            cost_calc.record_notification(
+                                costs::calculator::Component::Webhook,
+                                1,
+                                started.elapsed(),
+                            );
+                        });
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         warn!(
@@ -271,7 +356,7 @@ async fn main() -> anyhow::Result<()> {
                     .email_public_base_url
                     .clone()
                     .unwrap_or_else(|| format!("http://localhost:{}", config.port));
-                let notifier = email::EmailNotifier::new(
+                let mut notifier = email::EmailNotifier::new(
                     smtp_host.clone(),
                     config.email_smtp_port,
                     config.email_smtp_user.clone(),
@@ -293,6 +378,8 @@ async fn main() -> anyhow::Result<()> {
                     pool.clone(),
                     base_url,
                 );
+                // Issue #1264: attribute email delivery spend to the cost tracker.
+                notifier.set_cost_calculator(cost_calculator.clone());
 
                 info!(
                     smtp_host = %smtp_host,
@@ -305,11 +392,11 @@ async fn main() -> anyhow::Result<()> {
                 // SPF deliverability check (Issue #486): warn at startup if the
                 // sending domain has no SPF record. Best-effort and non-blocking.
                 let spf_from = from.clone();
-                tokio::spawn(async move {
+                jobs.spawn_oneshot("email-spf-check", async move {
                     email::verify_spf_record(&spf_from).await;
                 });
 
-                notifier.spawn(email_rx);
+                jobs.adopt("email-notifier", notifier.spawn(email_rx));
             } else {
                 warn!(
                     "EMAIL_SMTP_HOST is set but EMAIL_TO is empty — email notifications disabled"
@@ -368,7 +455,7 @@ async fn main() -> anyhow::Result<()> {
     // Issue #619: Spawn subscription email delivery worker.
     {
         let email_pool = pool.clone();
-        tokio::spawn(subscriptions::run_email_delivery_worker(email_pool));
+        jobs.spawn("subscription-email-delivery", subscriptions::run_email_delivery_worker(email_pool));
     }
 
     // Issue #1162: Encrypt integration credentials at rest with a dedicated key,
@@ -379,7 +466,7 @@ async fn main() -> anyhow::Result<()> {
     );
     {
         let backfill_pool = pool.clone();
-        tokio::spawn(async move {
+        jobs.spawn_oneshot("integration-secrets-backfill", async move {
             if let Err(e) = soroban_pulse::integration_secrets::backfill_plaintext(&backfill_pool).await {
                 error!(error = %e, "Failed to backfill integration credential encryption");
             }
@@ -387,15 +474,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Issue #1057: Auto-fetch contract specs (gated by AUTO_FETCH_CONTRACT_SPECS).
-    tokio::spawn(soroban_pulse::contract_specs::run_worker(pool.clone(), config.stellar_rpc_url.clone()));
+    if soroban_pulse::contract_specs::enabled() {
+        jobs.spawn("contract-specs", soroban_pulse::contract_specs::run_worker(pool.clone(), config.stellar_rpc_url.clone()));
+    }
 
     // Issue #1058: Track contract WASM versions and emit contract_upgraded events.
-    tokio::spawn(soroban_pulse::contract_versions::run_worker(pool.clone(), config.stellar_rpc_url.clone(), event_tx.clone()));
+    jobs.spawn("contract-versions", soroban_pulse::contract_versions::run_worker(pool.clone(), config.stellar_rpc_url.clone(), event_tx.clone()));
 
     // Issue #620: Spawn push notification delivery worker.
     {
         let push_pool = pool.clone();
-        tokio::spawn(push_notification::run_push_delivery_worker(push_pool));
+        jobs.spawn("push-delivery", push_notification::run_push_delivery_worker(push_pool));
     }
 
     // Issue #622 / #1244: the pool monitor and adaptive tuner were started by
@@ -411,7 +500,7 @@ async fn main() -> anyhow::Result<()> {
         info!(stream_key = %redis_stream_key, "Redis publisher enabled");
 
         let redis_buffer_max_size = config.redis_buffer_max_size;
-        tokio::spawn(async move {
+        jobs.spawn("redis-publisher", async move {
             queue_publisher::spawn_redis_publisher(
                 redis_url,
                 redis_stream_key,
@@ -433,6 +522,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Build and wire up the indexer only when this instance is configured to run it.
     let rpc_client = indexer::SorobanRpcClient::new(&config)?;
+    // Issue #1256: measures endpoint latency for routing; spawned with the indexer.
+    let rpc_latency_probe = rpc_client.latency_probe();
     let mut indexer = indexer::Indexer::new(
         pool.clone(),
         config.clone(),
@@ -443,15 +534,21 @@ async fn main() -> anyhow::Result<()> {
     indexer.set_indexer_state(indexer_state.clone());
     indexer.set_event_tx(event_tx.clone());
     indexer.set_sse_ring_buffer(std::sync::Arc::clone(&sse_ring_buf));
+    // Issue #1264: track RPC call and DB query costs from the indexer.
+    indexer.set_cost_calculator(cost_calculator.clone());
 
     // Issue #266: Initialize and seed bloom filter
     {
-        let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(
-            config.bloom_filter_capacity,
-            config.bloom_filter_fp_rate,
-        )?);
+        // Determine bloom filter parameters: auto-size if BLOOM_EXPECTED_ITEMS is set, else use configured values
+        let (capacity, fp_rate) = if config.bloom_expected_items > 0 {
+            bloom_filter::auto_size_bloom_filter(config.bloom_expected_items, config.bloom_false_positive_rate)
+        } else {
+            (config.bloom_filter_capacity, config.bloom_filter_fp_rate)
+        };
+
+        let bloom = std::sync::Arc::new(bloom_filter::EventBloomFilter::new(capacity, fp_rate)?);
         match bloom_filter::seed_from_db(&bloom, &pool, 100_000).await {
-            Ok(n) => info!(seeded = n, "Bloom filter seeded from DB"),
+            Ok(n) => info!(seeded = n, capacity = capacity, fp_rate = fp_rate, "Bloom filter seeded from DB"),
             Err(e) => tracing::warn!(error = %e, "Failed to seed bloom filter from DB"),
         }
         indexer.set_bloom_filter(bloom);
@@ -555,12 +652,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let mut secondary_indexer_handles = Vec::new();
-    let indexer_handle = if config.role.runs_indexer() {
+    let mut indexer_job_names = Vec::new();
+    if config.role.runs_indexer() {
         // Spawn the indexer background task.
-        let handle = tokio::spawn(async move {
+        jobs.spawn("indexer", async move {
             indexer.run().await;
         });
+        tokio::spawn(rpc_latency_probe.run(shutdown_rx.clone()));
+        indexer_job_names.push("indexer".to_string());
 
         // Issue #1063: index additional networks (e.g. testnet alongside
         // mainnet) concurrently from this same deployment. Each additional
@@ -579,6 +678,9 @@ async fn main() -> anyhow::Result<()> {
             let mut network_config = config.clone();
             network_config.chain_id = target.chain_id.clone();
             network_config.stellar_rpc_url = target.rpc_url.clone();
+            // The primary network's fallbacks belong to a different chain;
+            // never route this network's requests to them.
+            network_config.stellar_rpc_fallback_urls = Vec::new();
 
             let network_rpc_client = match indexer::SorobanRpcClient::new(&network_config) {
                 Ok(client) => client,
@@ -587,6 +689,7 @@ async fn main() -> anyhow::Result<()> {
                     continue;
                 }
             };
+            tokio::spawn(network_rpc_client.latency_probe().run(shutdown_rx.clone()));
             let mut network_indexer = indexer::Indexer::new(
                 pool.clone(),
                 network_config,
@@ -597,15 +700,17 @@ async fn main() -> anyhow::Result<()> {
             network_indexer.set_indexer_state(indexer_state.clone());
             network_indexer.set_event_tx(event_tx.clone());
             network_indexer.set_sse_ring_buffer(std::sync::Arc::clone(&sse_ring_buf));
+            network_indexer.set_cost_calculator(cost_calculator.clone());
 
-            let handle = tokio::spawn(async move {
+            let job_name = format!("indexer:{}", target.chain_id);
+            jobs.spawn(job_name.clone(), async move {
                 network_indexer.run().await;
             });
-            secondary_indexer_handles.push(handle);
+            indexer_job_names.push(job_name);
         }
 
         // Spawn index usage monitoring background task (indexer role only)
-        index_monitor::spawn(
+        jobs.adopt("index-monitor", index_monitor::spawn(
             pool.clone(),
             config.index_check_interval_hours,
             shutdown_rx.clone(),
@@ -614,37 +719,69 @@ async fn main() -> anyhow::Result<()> {
                 critical_ratio: config.fragmentation_critical_threshold,
                 auto_reindex: config.fragmentation_auto_reindex,
             },
-        );
+        ));
 
         // Spawn replica sync monitoring background task (#586)
-        replica_monitor::spawn(pool.clone(), 60, shutdown_rx.clone());
+        jobs.adopt("replica-monitor", replica_monitor::spawn(pool.clone(), 60, shutdown_rx.clone()));
 
         // Spawn feature flag rollback watcher (#587)
-        feature_flags::spawn(pool.clone(), 60, shutdown_rx.clone());
+        jobs.adopt("feature-flag-watcher", feature_flags::spawn(pool.clone(), 60, shutdown_rx.clone()));
 
         // Spawn materialized-view refresh background task
-        stats_refresh::spawn(
-            pool.clone(),
-            config.stats_refresh_interval_secs,
-            shutdown_rx.clone(),
+        jobs.adopt(
+            "stats-refresh",
+            stats_refresh::spawn(
+                pool.clone(),
+                config.stats_refresh_interval_secs,
+                shutdown_rx.clone(),
+            ),
         );
-
-        Some(handle)
     } else {
         info!("ROLE=api: indexer and indexer-only background tasks skipped");
         // Drop the un-spawned indexer so its resources are freed.
         drop(indexer);
-        None
-    };
+    }
 
     // Spawn resource metrics collector (all roles — useful on api pods too)
-    resource_metrics::spawn_resource_collector(shutdown_rx.clone());
+    jobs.adopt("resource-metrics", resource_metrics::spawn_resource_collector(shutdown_rx.clone()));
+
+    // Issue #1262: Spawn the derived metrics evaluation job. It evaluates each
+    // user-defined metric on its configured schedule, publishes the results to
+    // the Prometheus registry and persists snapshots for history.
+    {
+        let derived_metrics_config = derived_metrics::DerivedMetricsConfig::from_config(&config);
+        if derived_metrics_config.metrics.is_empty() {
+            info!("No derived metrics configured — derived metrics job not started");
+        } else {
+            info!(
+                count = derived_metrics_config.metrics.len(),
+                "Starting derived metrics evaluation job"
+            );
+            derived_metrics::spawn_evaluation_job(
+                pool.clone(),
+                derived_metrics_config,
+                shutdown_rx.clone(),
+            );
+        }
+    }
+
+    // Issue #1263: Spawn the incident correlation detector loop. It correlates
+    // anomaly alerts, RPC errors and indexer lag into incidents.
+    {
+        let incident_config = incident_correlation::IncidentCorrelationConfig::from_config(&config);
+        info!(
+            window_secs = incident_config.correlation_window_secs,
+            interval_secs = incident_config.evaluation_interval_secs,
+            "Starting incident correlation detector"
+        );
+        incident_correlation::spawn_detector(pool.clone(), incident_config, shutdown_rx.clone());
+    }
 
     // #496: Spawn audit log purge job
     {
         let audit_pool = pool.clone();
         let retention_days = config.notification_audit_log_retention_days;
-        tokio::spawn(notification_admin::purge_old_audit_log_entries(audit_pool, retention_days));
+        jobs.spawn("audit-log-purge", notification_admin::purge_old_audit_log_entries(audit_pool, retention_days));
     }
 
     // #498: Spawn channel health checker
@@ -656,11 +793,14 @@ async fn main() -> anyhow::Result<()> {
             .context("Failed to build health check HTTP client")?;
         let interval_secs = config.notification_health_check_interval_secs;
         let health_check_email = config.notification_health_check_email.clone();
-        notification_admin::spawn_channel_health_checker(
-            health_pool,
-            health_client,
-            interval_secs,
-            health_check_email,
+        jobs.adopt(
+            "channel-health-checker",
+            notification_admin::spawn_channel_health_checker(
+                health_pool,
+                health_client,
+                interval_secs,
+                health_check_email,
+            ),
         );
     }
 
@@ -676,11 +816,13 @@ async fn main() -> anyhow::Result<()> {
             // practice this branch only fires if main is re-entered, which
             // does not happen, so we just log and move on.
         }
-        slo_tracker::SloTracker::spawn_evaluator(
-            slo_tracker,
+        if let Some(handle) = slo_tracker::SloTracker::spawn_evaluator(
+            slo_tracker.clone(),
             shutdown_rx.clone(),
             slo_tracker::DEFAULT_EVAL_INTERVAL_SECS,
-        );
+        ) {
+            jobs.adopt("slo-evaluator", handle);
+        }
         info!(
             interval_secs = slo_tracker::DEFAULT_EVAL_INTERVAL_SECS,
             slos_tracked = slo_tracker.definition_count(),
@@ -730,7 +872,7 @@ async fn main() -> anyhow::Result<()> {
         // Wait for SSE connections to drain
         tokio::time::sleep(Duration::from_secs(sse_drain_timeout_secs)).await;
 
-        tokio::spawn(async {
+        soroban_pulse::job_scheduler::global().spawn("shutdown-timeout", async {
             tokio::time::sleep(Duration::from_secs(30)).await;
             tracing::info!("Graceful shutdown timeout reached (30s), forcing exit");
             std::process::exit(0);
@@ -741,9 +883,13 @@ async fn main() -> anyhow::Result<()> {
     let sse_drain_timeout = config.sse_drain_timeout_secs;
     let sse_shutdown_grace_period = config.sse_shutdown_grace_period_ms;
     let shutdown_tx_clone = shutdown_tx.clone();
-    tokio::spawn(async move {
+    jobs.spawn("shutdown-signal", async move {
         shutdown_signal(event_tx_clone, sse_drain_timeout, sse_shutdown_grace_period, shutdown_tx_clone).await;
     });
+    jobs.spawn(
+        "jobs-metrics",
+        soroban_pulse::job_scheduler::run_metrics_refresher(jobs.clone(), shutdown_rx.clone()),
+    );
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.port));
     info!(role = ?config.role, addr = %addr, "Binding HTTP server");
@@ -826,13 +972,14 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
 
-    // Wait for the indexer task to finish (only present when role runs indexer).
-    if let Some(handle) = indexer_handle {
-        let _ = handle.await;
+    // Wait for the indexer tasks to finish (only present when role runs indexer),
+    // then abort the remaining background jobs.
+    for name in &indexer_job_names {
+        if let Some(handle) = jobs.take(name) {
+            let _ = handle.await;
+        }
     }
-    for handle in secondary_indexer_handles {
-        let _ = handle.await;
-    }
+    jobs.shutdown_all();
 
     #[cfg(feature = "otel")]
     global::shutdown_tracer_provider();

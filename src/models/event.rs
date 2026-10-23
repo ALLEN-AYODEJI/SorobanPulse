@@ -170,6 +170,14 @@ pub struct Event {
     /// suffix (Issue #1065).
     #[sqlx(default)]
     pub event_index: Option<i32>,
+    /// Underlying asset code when the event was emitted by a Stellar Asset
+    /// Contract (`"native"` for XLM); `null` otherwise (Issue #1254).
+    #[sqlx(default)]
+    pub asset_code: Option<String>,
+    /// Issuer (`G...`) of the SAC's underlying asset; `null` for native XLM
+    /// and non-SAC events (Issue #1254).
+    #[sqlx(default)]
+    pub asset_issuer: Option<String>,
     #[sqlx(default)]
     #[serde(skip)]
     pub total_count: i64,
@@ -289,7 +297,8 @@ pub struct SearchParams {
 impl SearchParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
-        (page - 1) * self.limit()
+        // Saturate so huge `page` values cannot overflow (Issue #1225).
+        (page - 1).saturating_mul(self.limit())
     }
 
     pub fn limit(&self) -> i64 {
@@ -627,6 +636,18 @@ pub struct ContractSummary {
     pub first_seen_ledger: i64,
     pub last_seen_ledger: i64,
     pub last_event_at: DateTime<Utc>,
+    /// Deployer address from the contract's creation event (Issue #1255);
+    /// `null` until a deployment event has been indexed.
+    #[sqlx(default)]
+    pub deployer: Option<String>,
+    /// Current WASM hash (hex) from deployment/upgrade events (Issue #1255).
+    #[sqlx(default)]
+    pub wasm_hash: Option<String>,
+    #[sqlx(default)]
+    pub deployed_at: Option<DateTime<Utc>>,
+    /// Name from the contract labels registry, if registered (Issue #1255).
+    #[sqlx(default)]
+    pub label: Option<String>,
 }
 
 /// Detailed per-contract summary returned by GET /v1/contracts/:contract_id/summary.
@@ -716,6 +737,9 @@ impl PaginationParams {
         "created_at",
         "schema_version",
         "anonymized",
+        // Issue #1254: SAC underlying asset (null for non-SAC events).
+        "asset_code",
+        "asset_issuer",
     ];
     pub const MAX_CONTRACT_IDS_FILTER: usize = 20;
 
@@ -750,7 +774,8 @@ impl PaginationParams {
     pub fn offset(&self) -> i64 {
         let page = self.page.unwrap_or(1).max(1);
         let limit = self.limit();
-        (page - 1) * limit
+        // Saturate so huge `page` values cannot overflow (Issue #1225).
+        (page - 1).saturating_mul(limit)
     }
 
     pub fn limit(&self) -> i64 {
@@ -994,6 +1019,17 @@ mod tests {
     #[test]
     fn page_3_limit_10_offset_is_20() {
         assert_eq!(params(Some(3), Some(10)).offset(), 20);
+    }
+
+    // Regression test for fuzz crash in fuzz_pagination_params (Issue #1225).
+    #[test]
+    fn huge_page_offset_saturates_instead_of_overflowing() {
+        let p: PaginationParams =
+            serde_json::from_str(r#"{"page":9223372036854775807,"limit":100}"#).unwrap();
+        assert_eq!(p.offset(), i64::MAX);
+        let s: SearchParams =
+            serde_json::from_str(r#"{"page":9223372036854775807,"limit":100}"#).unwrap();
+        assert_eq!(s.offset(), i64::MAX);
     }
 
     // --- RPC deserialization fixture tests ---
